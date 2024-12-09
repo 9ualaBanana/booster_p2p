@@ -38,8 +38,9 @@ SessionFactory = sessionmaker(bind=engine)
 
 load_dotenv()
 TOKEN = os.getenv('TOKEN')
-ACCEPT_ORDER_TIMEOUT = float(os.getenv('ACCEPT_ORDER_TIMEOUT'))
 API_KEY = os.getenv('API_KEY')
+ACCEPT_ORDER_TIMEOUT = float(os.getenv('ACCEPT_ORDER_TIMEOUT'))
+TOP_LENGTH = int(os.getenv('TOP_LENGTH'))
     
 CHANGE_EXCHANGE_RATE, CHANGE_CARD_DETAILS, DEPOSIT_USDT = range(3)
 
@@ -208,7 +209,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         users = session.query(User).order_by(User.exchange_rate).all()
 
         await update.effective_message.reply_text(
-            f"{user}\nРеквизиты: {user.card}\n\nTOP:\n{'\n'.join([f"{user[0]}. {user[1]}" for user in enumerate(users, 1)])}",
+            f"{user}\nРеквизиты: {user.card}\n\nTOP:\n{'\n'.join([f"{user[0]}. {user[1]}" for user in enumerate(users[:TOP_LENGTH], 1)])}",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("Купить USDT", callback_data=deposit_usdt.__name__)],
                 [InlineKeyboardButton("Изменить курс", callback_data=change_exchange_rate.__name__)],
