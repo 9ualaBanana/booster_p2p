@@ -1,47 +1,19 @@
 from asyncio import Event, run, wait_for
+from config import TOKEN, API_KEY, ACCEPT_ORDER_TIMEOUT, TOP_LENGTH
 from creditcard import CreditCard
-from dotenv import load_dotenv
+from database import SessionFactory, User
 from fastapi import FastAPI, HTTPException, Header, Depends
 import logging
-import os
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, BigInteger, Float, String
-from sqlalchemy.orm import sessionmaker, declarative_base
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ConversationHandler
 from uvicorn import Config, Server
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    level=logging.DEBUG
 )
 
-Base = declarative_base()
-
-class User(Base):
-    __tablename__ = 'users'
-
-    id = Column(BigInteger, primary_key=True)
-    name = Column(String, nullable=False)
-    card = Column(String, unique=True)
-    balance = Column(Float, nullable=False, default=0)
-    frozen_balance = Column(Float, nullable=False, default=0)
-    exchange_rate = Column(Float, default=0)
-
-    def __repr__(self):
-        return f"{self.name} | {self.balance} USDT | 1 USDT = {self.exchange_rate} ₽"
-
-# engine = create_engine('postgresql+psycopg://postgres:admin@localhost/p2p')
-engine = create_engine('sqlite:///p2p.db')
-Base.metadata.create_all(engine)
-SessionFactory = sessionmaker(bind=engine)
-
-load_dotenv()
-TOKEN = os.getenv('TOKEN')
-API_KEY = os.getenv('API_KEY')
-ACCEPT_ORDER_TIMEOUT = float(os.getenv('ACCEPT_ORDER_TIMEOUT'))
-TOP_LENGTH = int(os.getenv('TOP_LENGTH'))
-    
 CHANGE_EXCHANGE_RATE, CHANGE_CARD_DETAILS, DEPOSIT_USDT = range(3)
 
 application = ApplicationBuilder().token(TOKEN).build()
@@ -51,11 +23,11 @@ async def validate_api_key(x_api_key: str = Header(...)):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=403, detail="Invalid API Key")
 
-class DepositRequest(BaseModel):
+class BuyRequest(BaseModel):
     amount: float
-    
+
 @app.post("/buy_usdt", dependencies=[Depends(validate_api_key)])
-async def deposit_usdt(request: DepositRequest):
+async def buy_usdt(request: BuyRequest):
     if request.amount <= 0:
         raise HTTPException(status_code=400, detail="Amount must be positive.")
 
@@ -72,6 +44,9 @@ async def deposit_usdt(request: DepositRequest):
             event = Event()
             application.bot_data[message.id] = event
             try:
+                # Implement buy/sell transactions.
+                # * Add balance after Deposit USDT transaction is completed and confirmed. (consider smart contract)
+                # * Freeze balance if buy order is accepted.
                 await wait_for(event.wait(), timeout=ACCEPT_ORDER_TIMEOUT)
                 user.balance -= request.amount
                 user.frozen_balance += request.amount
@@ -97,7 +72,7 @@ async def accept_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         raise ValueError("Event waiting for accepted order was expected.")
 
 
-async def deposit_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def buy_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     await update.callback_query.message.reply_text("Сколько USDT вы хотите купить?")
     
@@ -172,6 +147,7 @@ async def receive_card_details(update: Update, context: ContextTypes.DEFAULT_TYP
     if card_number.isdigit():
         card = CreditCard(card_number)
         if card.is_valid and not card.is_expired:
+            with SessionFactory() as session:
                 user = session.query(User).filter_by(id=update.effective_user.id).one_or_none()
                 
                 if user:
@@ -213,7 +189,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(
             f"{user}\nРеквизиты: {user.card}\n\nTOP:\n{'\n'.join([f"{user[0]}. {user[1]}" for user in enumerate(users[:TOP_LENGTH], 1)])}",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Купить USDT", callback_data=deposit_usdt.__name__)],
+                [InlineKeyboardButton("Купить USDT", callback_data=buy_usdt.__name__)],
                 [InlineKeyboardButton("Изменить курс", callback_data=change_exchange_rate.__name__)],
                 [InlineKeyboardButton("Изменить реквизиты", callback_data=change_card_details.__name__)]
             ]))
@@ -250,7 +226,7 @@ async def main():
     )
 
     conv_handler_deposit_usdt = ConversationHandler(
-        entry_points=[CallbackQueryHandler(deposit_usdt, pattern=deposit_usdt.__name__)],
+        entry_points=[CallbackQueryHandler(buy_usdt, pattern=buy_usdt.__name__)],
         states={
             DEPOSIT_USDT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_deposit_usdt)],
         },
