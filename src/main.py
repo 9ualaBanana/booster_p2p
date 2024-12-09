@@ -127,6 +127,7 @@ async def receive_deposit_usdt(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text(f"Баланс пополнен: {user.balance} USDT.")
         else:
             await update.message.reply_text("Аккаунт не найден.")
+            # Must be impossible. Redirect to registration.
 
     return ConversationHandler.END
 
@@ -156,6 +157,7 @@ async def receive_exchange_rate(update: Update, context: ContextTypes.DEFAULT_TY
             await update.message.reply_text(f"Курс обновлен: {new_exchange_rate} ₽.")
         else:
             await update.message.reply_text("Аккаунт не найден.")
+            # Must be impossible. Redirect to registration.
     
     return ConversationHandler.END
 
@@ -166,28 +168,28 @@ async def change_card_details(update: Update, context: ContextTypes.DEFAULT_TYPE
     return CHANGE_CARD_DETAILS
 
 async def receive_card_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    card = CreditCard(update.message.text.strip())
-
-    if not card.is_valid or card.is_expired:
-        await update.message.reply_text("Предоставленные реквезиты некорректны.")
-        return
+    card_number = ''.join(update.message.text.strip().split())
+    if card_number.isdigit():
+        card = CreditCard(card_number)
+        if card.is_valid and not card.is_expired:
+                user = session.query(User).filter_by(id=update.effective_user.id).one_or_none()
+                
+                if user:
+                    user.card = card.number
+                    session.commit()
+                    
+                    await update.message.reply_text(f"Реквизиты успешно изменены {card.number}.")
+                else:
+                    await update.message.reply_text("Аккаунт не найден.")
+                    # Must be impossible. Redirect to registration.
+                
+                if user.exchange_rate == 0:
+                    await update.effective_message.reply_text("Предоставьте новый курс:")
+                    return CHANGE_EXCHANGE_RATE
+                else:
+                    return ConversationHandler.END
     
-    with SessionFactory() as session:
-        user = session.query(User).filter_by(id=update.effective_user.id).one_or_none()
-        
-        if user:
-            user.card = card.number
-            session.commit()
-            
-            await update.message.reply_text(f"Реквизиты успешно изменены {card.number}.")
-        else:
-            await update.message.reply_text("Аккаунт не найден.")
-        
-        if user.exchange_rate == 0:
-            await update.effective_message.reply_text("Предоставьте новый курс:")
-            return CHANGE_EXCHANGE_RATE
-        else:
-            return ConversationHandler.END
+    await update.message.reply_text("Предоставленные реквезиты некорректны.")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with SessionFactory() as session:
