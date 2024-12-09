@@ -1,7 +1,7 @@
 from asyncio import Event, run, wait_for
 from creditcard import CreditCard
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header, Depends
 import logging
 import os
 from pydantic import BaseModel
@@ -39,16 +39,21 @@ SessionFactory = sessionmaker(bind=engine)
 load_dotenv()
 TOKEN = os.getenv('TOKEN')
 ACCEPT_ORDER_TIMEOUT = float(os.getenv('ACCEPT_ORDER_TIMEOUT'))
+API_KEY = os.getenv('API_KEY')
     
 CHANGE_EXCHANGE_RATE, CHANGE_CARD_DETAILS, DEPOSIT_USDT = range(3)
 
 application = ApplicationBuilder().token(TOKEN).build()
 app = FastAPI()
 
+async def validate_api_key(x_api_key: str = Header(...)):
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API Key")
+
 class DepositRequest(BaseModel):
     amount: float
-
-@app.post("/buy_usdt")
+    
+@app.post("/buy_usdt", dependencies=[Depends(validate_api_key)])
 async def deposit_usdt(request: DepositRequest):
     if request.amount <= 0:
         raise HTTPException(status_code=400, detail="Amount must be positive.")
