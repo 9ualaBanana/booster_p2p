@@ -74,7 +74,8 @@ async def accept_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def buy_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
-    await update.callback_query.message.reply_text("Сколько USDT вы хотите купить?")
+    await update.effective_message.reply_text("Сколько USDT вы хотите купить?")
+    await update.effective_message.delete()
     
     return BUY_USDT
 
@@ -108,7 +109,8 @@ async def receive_buy_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def change_card_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
-    await update.callback_query.message.reply_text("Предоставьте новые реквезиты:")
+    await update.effective_message.reply_text("Предоставьте новые реквезиты:")
+    await update.effective_message.delete()
     
     return CHANGE_CARD_DETAILS
 
@@ -138,7 +140,8 @@ async def receive_card_details(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def change_exchange_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
-    await update.callback_query.message.reply_text("Предоставьте новый курс:")
+    await update.effective_message.reply_text("Предоставьте новый курс:")
+    await update.effective_message.delete()
     
     return CHANGE_EXCHANGE_RATE
 
@@ -189,17 +192,24 @@ async def display_account(update: Update, user: User, session):
             [InlineKeyboardButton("Изменить курс", callback_data=change_exchange_rate.__name__)],
             [InlineKeyboardButton("Изменить реквизиты", callback_data=change_card_details.__name__)]
         ]))
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['active_conversation'] = None
+    await update.message.reply_text("Операция отменена.")
+    return ConversationHandler.END
     
 
 async def main():
+    cancel_handler = CommandHandler("cancel", cancel)
+
     conv_handler_registration = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
             CHANGE_EXCHANGE_RATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_exchange_rate)],
             CHANGE_CARD_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_card_details)],
         },
-        fallbacks=[],
-        persistent=False
+        fallbacks=[cancel_handler],
+        persistent=False,
     )
 
     conv_handler_exchange_rate = ConversationHandler(
@@ -207,8 +217,8 @@ async def main():
         states={
             CHANGE_EXCHANGE_RATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_exchange_rate)],
         },
-        fallbacks=[],
-        persistent=False
+        fallbacks=[cancel_handler],
+        persistent=False,
     )
 
     conv_handler_card_details = ConversationHandler(
@@ -216,7 +226,7 @@ async def main():
         states={
             CHANGE_CARD_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_card_details)],
         },
-        fallbacks=[],
+        fallbacks=[cancel_handler],
         persistent=False,
     )
 
@@ -225,7 +235,7 @@ async def main():
         states={
             BUY_USDT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_buy_usdt)],
         },
-        fallbacks=[],
+        fallbacks=[cancel_handler],
         persistent=False,
     )
 
