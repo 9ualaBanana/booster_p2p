@@ -14,7 +14,7 @@ logging.basicConfig(
     level=logging.DEBUG
 )
 
-CHANGE_EXCHANGE_RATE, CHANGE_CARD_DETAILS, DEPOSIT_USDT = range(3)
+CHANGE_EXCHANGE_RATE, CHANGE_CARD_DETAILS, BUY_USDT = range(3)
 
 application = ApplicationBuilder().token(TOKEN).build()
 app = FastAPI()
@@ -76,9 +76,9 @@ async def buy_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     await update.callback_query.message.reply_text("Сколько USDT вы хотите купить?")
     
-    return DEPOSIT_USDT
+    return BUY_USDT
 
-async def receive_deposit_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def receive_buy_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         amount = float(update.message.text.strip())
         if amount <= 0:
@@ -106,6 +106,36 @@ async def receive_deposit_usdt(update: Update, context: ContextTypes.DEFAULT_TYP
 
     return ConversationHandler.END
 
+async def change_card_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    await update.callback_query.message.reply_text("Предоставьте новые реквезиты:")
+    
+    return CHANGE_CARD_DETAILS
+
+async def receive_card_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    card_number = ''.join(update.message.text.strip().split())
+    if card_number.isdigit():
+        card = CreditCard(card_number)
+        if card.is_valid and not card.is_expired:
+            with SessionFactory() as session:
+                user: User | None = session.query(User).filter_by(id=update.effective_user.id).one_or_none()
+                if user is None:
+                    user = context.user_data.get('new_user', None)
+                    if user is not None:
+                        user.card = card.number
+                        await update.message.reply_text(f"Реквизиты успешно изменены {card.number}.")
+                        await update.effective_message.reply_text("Предоставьте новый курс:")
+                        return CHANGE_EXCHANGE_RATE
+                else:
+                    user.card = card.number
+                    session.commit()
+                    await update.message.reply_text(f"Реквизиты успешно изменены {card.number}.")
+                    await display_account(update, user, session)
+
+                    return ConversationHandler.END
+    
+    await update.message.reply_text("Предоставленные реквезиты некорректны.")
+
 async def change_exchange_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     await update.callback_query.message.reply_text("Предоставьте новый курс:")
@@ -121,89 +151,53 @@ async def receive_exchange_rate(update: Update, context: ContextTypes.DEFAULT_TY
     except ValueError:
         await update.message.reply_text("Некорректный курс.")
         return
-        
+    
     with SessionFactory() as session:
-        user = session.query(User).filter_by(id=update.effective_user.id).one_or_none()
-        
-        if user:
-            user.exchange_rate = new_exchange_rate
-            session.commit()
+        user: User | None = session.query(User).filter_by(id=update.effective_user.id).one_or_none()
+        if user is None:
+            user = context.user_data.get('new_user', None)
+            if user is not None:
+                session.add(user)
+        user.exchange_rate = new_exchange_rate
+        session.commit()
             
-            await update.message.reply_text(f"Курс обновлен: {new_exchange_rate} ₽.")
-        else:
-            await update.message.reply_text("Аккаунт не найден.")
-            # Must be impossible. Redirect to registration.
-    
+        await update.message.reply_text(f"Курс обновлен: {new_exchange_rate} ₽.")
+        await display_account(update, user, session)
+
     return ConversationHandler.END
-
-async def change_card_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer()
-    await update.callback_query.message.reply_text("Предоставьте новые реквезиты:")
-    
-    return CHANGE_CARD_DETAILS
-
-async def receive_card_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    card_number = ''.join(update.message.text.strip().split())
-    if card_number.isdigit():
-        card = CreditCard(card_number)
-        if card.is_valid and not card.is_expired:
-            with SessionFactory() as session:
-                user = session.query(User).filter_by(id=update.effective_user.id).one_or_none()
-                
-                if user:
-                    user.card = card.number
-                    session.commit()
-                    
-                    await update.message.reply_text(f"Реквизиты успешно изменены {card.number}.")
-                else:
-                    await update.message.reply_text("Аккаунт не найден.")
-                    # Must be impossible. Redirect to registration.
-                
-                if user.exchange_rate == 0:
-                    await update.effective_message.reply_text("Предоставьте новый курс:")
-                    return CHANGE_EXCHANGE_RATE
-                else:
-                    return ConversationHandler.END
-    
-    await update.message.reply_text("Предоставленные реквезиты некорректны.")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with SessionFactory() as session:
         user = session.query(User).filter_by(id=update.effective_user.id).one_or_none()
-        
+
         if user is None:
-            user = User(id=update.effective_user.id, name=update.effective_user.name)
-            session.add(user)
-            session.commit()
-        
-        if user.card is None:
-            await update.effective_message.reply_text("Предоставьте новые реквизиты:")
+            context.user_data['new_user'] = User(id=update.effective_user.id, name=update.effective_user.name)
+            await update.effective_message.reply_text("Предоставьте новые реквезиты:")
             return CHANGE_CARD_DETAILS
+        
+        await display_account(update, user, session)
 
-        if user.exchange_rate == 0:
-            await update.effective_message.reply_text("Предоставьте новый курс:")
-            return CHANGE_EXCHANGE_RATE
+        return ConversationHandler.END
 
-        users = session.query(User).order_by(User.exchange_rate).all()
+async def display_account(update: Update, user: User, session):
+    users = session.query(User).order_by(User.exchange_rate).all()
 
-        await update.effective_message.reply_text(
-            f"{user}\nРеквизиты: {user.card}\n\nTOP:\n{'\n'.join([f"{user[0]}. {user[1]}" for user in enumerate(users[:TOP_LENGTH], 1)])}",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Купить USDT", callback_data=buy_usdt.__name__)],
-                [InlineKeyboardButton("Изменить курс", callback_data=change_exchange_rate.__name__)],
-                [InlineKeyboardButton("Изменить реквизиты", callback_data=change_card_details.__name__)]
-            ]))
-
+    await update.effective_message.reply_text(
+        f"{user}\nРеквизиты: {user.card}\n\nTOP:\n{'\n'.join([f"{user[0]}. {user[1]}" for user in enumerate(users[:TOP_LENGTH], 1)])}",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Купить USDT", callback_data=buy_usdt.__name__)],
+            [InlineKeyboardButton("Изменить курс", callback_data=change_exchange_rate.__name__)],
+            [InlineKeyboardButton("Изменить реквизиты", callback_data=change_card_details.__name__)]
+        ]))
+    
 
 async def main():
-    # Handle wrong inputs during conversations.
     conv_handler_registration = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
             CHANGE_EXCHANGE_RATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_exchange_rate)],
             CHANGE_CARD_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_card_details)],
         },
-        fallbacks=[],
         persistent=False
     )
 
@@ -212,7 +206,6 @@ async def main():
         states={
             CHANGE_EXCHANGE_RATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_exchange_rate)],
         },
-        fallbacks=[],
         persistent=False
     )
 
@@ -221,16 +214,14 @@ async def main():
         states={
             CHANGE_CARD_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_card_details)],
         },
-        fallbacks=[],
         persistent=False,
     )
 
     conv_handler_deposit_usdt = ConversationHandler(
         entry_points=[CallbackQueryHandler(buy_usdt, pattern=buy_usdt.__name__)],
         states={
-            DEPOSIT_USDT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_deposit_usdt)],
+            BUY_USDT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_buy_usdt)],
         },
-        fallbacks=[],
         persistent=False,
     )
 
