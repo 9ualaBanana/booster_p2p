@@ -198,6 +198,7 @@ async def main():
             CHANGE_EXCHANGE_RATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_exchange_rate)],
             CHANGE_CARD_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_card_details)],
         },
+        fallbacks=[],
         persistent=False
     )
 
@@ -206,6 +207,7 @@ async def main():
         states={
             CHANGE_EXCHANGE_RATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_exchange_rate)],
         },
+        fallbacks=[],
         persistent=False
     )
 
@@ -214,6 +216,7 @@ async def main():
         states={
             CHANGE_CARD_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_card_details)],
         },
+        fallbacks=[],
         persistent=False,
     )
 
@@ -222,6 +225,7 @@ async def main():
         states={
             BUY_USDT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_buy_usdt)],
         },
+        fallbacks=[],
         persistent=False,
     )
 
