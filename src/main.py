@@ -5,7 +5,7 @@ from fastapi import FastAPI, HTTPException
 import logging
 import os
 from pydantic import BaseModel
-from sqlalchemy import create_engine, Column, Integer, Double, String
+from sqlalchemy import create_engine, Column, BigInteger, Float, String
 from sqlalchemy.orm import sessionmaker, declarative_base
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ConversationHandler
@@ -21,12 +21,15 @@ Base = declarative_base()
 class User(Base):
     __tablename__ = 'users'
 
-    id = Column(Integer, primary_key=True)
-    name = Column(String)
-    card = Column(String)
-    balance = Column(Double)
-    frozen_balance = Column(Double)
-    exchange_rate = Column(Double)
+    id = Column(BigInteger, primary_key=True)
+    name = Column(String, nullable=False)
+    card = Column(String, unique=True)
+    balance = Column(Float, nullable=False, default=0)
+    frozen_balance = Column(Float, nullable=False, default=0)
+    exchange_rate = Column(Float, default=0)
+
+    def __repr__(self):
+        return f"{self.name} | {self.balance} USDT | 1 USDT = {self.exchange_rate} ₽"
 
 # engine = create_engine('postgresql+psycopg://postgres:admin@localhost/p2p')
 engine = create_engine('sqlite:///p2p.db')
@@ -185,7 +188,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = session.query(User).filter_by(id=update.effective_user.id).one_or_none()
         
         if user is None:
-            user = User(id=update.effective_user.id, name=update.effective_user.name, balance=0, frozen_balance=0, exchange_rate=0)
+            user = User(id=update.effective_user.id, name=update.effective_user.name)
             session.add(user)
             session.commit()
         
@@ -200,7 +203,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         users = session.query(User).order_by(User.exchange_rate).all()
 
         await update.effective_message.reply_text(
-            f"{update.effective_user.name} | {user.balance} USDT | 1 USDT = {user.exchange_rate} ₽\n\nTOP:\n{'\n'.join([f"{user[0]}. {user[1].name} | {user[1].balance} USDT | 1 USDT = {user[1].exchange_rate} ₽" for user in enumerate(users, 1)])}",
+            f"{user}\nРеквизиты: {user.card}\n\nTOP:\n{'\n'.join([f"{user[0]}. {user[1]}" for user in enumerate(users, 1)])}",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("Купить USDT", callback_data=deposit_usdt.__name__)],
                 [InlineKeyboardButton("Изменить курс", callback_data=change_exchange_rate.__name__)],
