@@ -33,7 +33,7 @@ async def buy_usdt(request: BuyRequest):
         raise HTTPException(status_code=400, detail="Amount must be positive.")
 
     with SessionFactory() as session:
-        users = session.query(User).filter(User.balance >= request.amount).order_by(User.exchange_rate).all()
+        users = session.query(User).filter(User.is_working, User.balance >= request.amount).order_by(User.exchange_rate).all()
 
         for user in users:
             message = await application.bot.send_message(user.id,
@@ -202,16 +202,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await display_account(update, user, session)
 
         return ConversationHandler.END
+    
+async def start_work(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with SessionFactory() as session:
+        user = session.query(User).filter_by(id=update.effective_user.id).one()
+        user.is_working = True
+        session.commit()
+        
+        await update.effective_message.delete()
+        await display_account(update, user, session)
+
+async def stop_work(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with SessionFactory() as session:
+        user = session.query(User).filter_by(id=update.effective_user.id).one()
+        user.is_working = False
+        session.commit()
+        
+        await update.effective_message.delete()
+        await display_account(update, user, session)
 
 async def display_account(update: Update, user: User, session):
     users = session.query(User).order_by(User.exchange_rate).all()
-
     await update.effective_message.reply_text(
         f"{user.name} | {user.balance} USDT | 1 USDT = {user.exchange_rate} ₽\nРеквизиты: {user.card}\n\nTOP:\n{'\n'.join([f"{user[0]}. {user[1].formatted_name} | {user[1].balance} USDT | 1 USDT = {user[1].exchange_rate} ₽" for user in enumerate(users[:TOP_LENGTH], 1)])}",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Купить USDT", callback_data=buy_usdt.__name__)],
             [InlineKeyboardButton("Изменить курс", callback_data=change_exchange_rate.__name__)],
-            [InlineKeyboardButton("Изменить реквизиты", callback_data=change_card_details.__name__)]
+            [InlineKeyboardButton("Изменить реквизиты", callback_data=change_card_details.__name__)],
+            [InlineKeyboardButton("Завершить работу", callback_data=stop_work.__name__)] if user.is_working else [InlineKeyboardButton("Начать работу", callback_data=start_work.__name__)]
         ]))
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -263,6 +281,7 @@ async def main():
     application.add_handlers([conv_handler_registration, conv_handler_deposit_usdt, conv_handler_exchange_rate, conv_handler_card_details])
     application.add_handler(CallbackQueryHandler(accept_order, pattern=accept_order.__name__))
     application.add_handler(CallbackQueryHandler(decline_order, pattern=decline_order.__name__))
+    application.add_handlers([CallbackQueryHandler(start_work, pattern=start_work.__name__), CallbackQueryHandler(stop_work, pattern=stop_work.__name__)])
 
     # Both servers .start() and not .run() so to not block the event loop on which they both must run.
     await application.initialize()
