@@ -39,7 +39,9 @@ async def buy_usdt(request: BuyRequest):
             message = await application.bot.send_message(user.id,
                 f"Запрос на покупку {request.amount} USDT\nБаланс: {user.balance} USDT\nПрибыль: {request.amount * user.exchange_rate} ₽",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Принять", callback_data=accept_order.__name__)]
+                    [
+                        InlineKeyboardButton("Принять", callback_data=accept_order.__name__),
+                        InlineKeyboardButton("Отклонить", callback_data=decline_order.__name__)]
                     ]))
 
             # Implement inner dictionary for orders inside bot_data.
@@ -77,6 +79,17 @@ async def accept_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order.state = Order.State.ACCEPTED
     else:
         raise ValueError("Order waiting for accepted order was expected.")
+    
+async def decline_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    order = context.bot_data.pop(update.effective_message.id, None)
+    
+    if isinstance(order, Order):
+        order.state = Order.State.DECLINED
+        # Additional cleanup if necessary
+        # await application.bot.delete_message(update.effective_chat.id, update.effective_message.id)
+    else:
+        raise ValueError("Order waiting for declined order was expected.")
     
 
 
@@ -249,6 +262,7 @@ async def main():
 
     application.add_handlers([conv_handler_registration, conv_handler_deposit_usdt, conv_handler_exchange_rate, conv_handler_card_details])
     application.add_handler(CallbackQueryHandler(accept_order, pattern=accept_order.__name__))
+    application.add_handler(CallbackQueryHandler(decline_order, pattern=decline_order.__name__))
 
     # Both servers .start() and not .run() so to not block the event loop on which they both must run.
     await application.initialize()
