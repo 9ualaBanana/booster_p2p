@@ -1,11 +1,11 @@
-from sqlalchemy import create_engine, Column, Integer, String, Float
+from sqlalchemy import create_engine, Column, BigInteger, String, Float
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 Base = declarative_base()
 
 class User(Base):
     __tablename__ = 'users'
-    id = Column(Integer, primary_key=True)
+    id = Column(BigInteger, primary_key=True)
     name = Column(String)
     card = Column(String, nullable=False)  # Ensure card cannot be null
     balance = Column(Float, default=0)
