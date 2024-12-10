@@ -186,7 +186,7 @@ async def display_account(update: Update, user: User, session):
     users = session.query(User).order_by(User.exchange_rate).all()
 
     await update.effective_message.reply_text(
-        f"{user}\nРеквизиты: {user.card}\n\nTOP:\n{'\n'.join([f"{user[0]}. {user[1]}" for user in enumerate(users[:TOP_LENGTH], 1)])}",
+        f"{user.name} | {user.balance} USDT | 1 USDT = {user.exchange_rate} ₽\nРеквизиты: {user.card}\n\nTOP:\n{'\n'.join([f"{user[0]}. {user[1].formatted_name} | {user[1].balance} USDT | 1 USDT = {user[1].exchange_rate} ₽" for user in enumerate(users[:TOP_LENGTH], 1)])}",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Купить USDT", callback_data=buy_usdt.__name__)],
             [InlineKeyboardButton("Изменить курс", callback_data=change_exchange_rate.__name__)],

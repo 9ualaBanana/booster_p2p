@@ -12,8 +12,14 @@ class User(Base):
     frozen_balance = Column(Float, default=0)
     exchange_rate = Column(Float, nullable=False)  # Ensure exchange_rate cannot be null
 
-    def __repr__(self):
-        return f"{self.name} | {self.balance} USDT | 1 USDT = {self.exchange_rate} ₽"
+    @property
+    def formatted_name(self):
+        max_length = 8
+        if len(self.name) <= max_length:
+            return self.name
+        else:
+            stripped_name = self.name[1:] if self.name.startswith('@') else self.name
+            return stripped_name[:max_length] + "..."
 
 # engine = create_engine('sqlite:///p2p.db')
 engine = create_engine('postgresql+psycopg://postgres:admin@localhost/p2p')
