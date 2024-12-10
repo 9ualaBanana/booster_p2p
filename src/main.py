@@ -1,9 +1,10 @@
-from asyncio import Event, run, wait_for
 from config import TOKEN, API_KEY, ACCEPT_ORDER_TIMEOUT, TOP_LENGTH
+from asyncio import run, wait_for
 from creditcard import CreditCard
 from database import SessionFactory, User
 from fastapi import FastAPI, HTTPException, Header, Depends
 import logging
+from order import Order
 from pydantic import BaseModel
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ConversationHandler
@@ -41,21 +42,26 @@ async def buy_usdt(request: BuyRequest):
                     [InlineKeyboardButton("Принять", callback_data=accept_order.__name__)]
                     ]))
 
-            event = Event()
-            application.bot_data[message.id] = event
+            # Implement inner dictionary for orders inside bot_data.
+            order = Order()
+            application.bot_data[message.id] = order
+
             try:
                 # Implement buy/sell transactions.
                 # * Add balance after Deposit USDT transaction is completed and confirmed. (consider smart contract)
                 # * Freeze balance if buy order is accepted.
-                await wait_for(event.wait(), timeout=ACCEPT_ORDER_TIMEOUT)
-                user.balance -= request.amount
-                user.frozen_balance += request.amount
-                session.commit()
+                await wait_for(order.event.wait(), timeout=ACCEPT_ORDER_TIMEOUT)
                 
-                return {
-                    "price": request.amount * user.exchange_rate,
-                    "card": user.card
+                if order.state == Order.State.ACCEPTED:
+                    user.balance -= request.amount
+                    user.frozen_balance += request.amount
+                    session.commit()
+                    
+                    return {
+                        "price": request.amount * user.exchange_rate,
+                        "card": user.card
                     }
+                
             except TimeoutError:
                 await application.bot.delete_message(message.chat_id, message.id)
                 application.bot_data.pop(message.id, None)
@@ -65,11 +71,13 @@ async def buy_usdt(request: BuyRequest):
 
 async def accept_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
-    event = context.bot_data.pop(update.effective_message.id, None)
-    if isinstance(event, Event):
-        event.set()
+    order = context.bot_data.pop(update.effective_message.id, None)
+    
+    if isinstance(order, Order):
+        order.state = Order.State.ACCEPTED
     else:
-        raise ValueError("Event waiting for accepted order was expected.")
+        raise ValueError("Order waiting for accepted order was expected.")
+    
 
 
 async def buy_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE):
