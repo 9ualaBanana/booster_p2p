@@ -54,7 +54,7 @@ async def buy_usdt(request: BuyRequest):
                 # * Freeze balance if buy order is accepted.
                 await wait_for(order.event.wait(), timeout=ACCEPT_ORDER_TIMEOUT)
                 
-                if order.state == Order.State.ACCEPTED:
+                if order.state is Order.State.ACCEPTED:
                     user.balance -= request.amount
                     user.frozen_balance += request.amount
                     session.commit()
