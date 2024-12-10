@@ -232,6 +232,7 @@ async def display_account(update: Update, user: User, session):
                 InlineKeyboardButton("Изменить реквизиты", callback_data=change_card_details.__name__)
             ],
             [InlineKeyboardButton("Завершить работу", callback_data=stop_work.__name__)] if user.is_working else [InlineKeyboardButton("Начать работу", callback_data=start_work.__name__)],
+            [InlineKeyboardButton("Руководство", url="https://example.com")]
         ]))
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
