@@ -1,11 +1,13 @@
+from typing import List
 from config import TOKEN, API_KEY, ACCEPT_ORDER_TIMEOUT, TOP_LENGTH
 from asyncio import run, wait_for
+from decimal import Decimal, ROUND_HALF_EVEN
 from creditcard import CreditCard
 from database import SessionFactory, User
 from fastapi import FastAPI, HTTPException, Header, Depends
 import logging
 from order import Order
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ConversationHandler
 from uvicorn import Config, Server
@@ -25,13 +27,16 @@ async def validate_api_key(x_api_key: str = Header(...)):
         raise HTTPException(status_code=403, detail="Invalid API Key")
 
 class BuyRequest(BaseModel):
-    amount: float
+    amount: Decimal
+    
+    @field_validator('amount')
+    def validate_amount(cls, amount):
+        if amount <= Decimal(0):
+            raise ValueError("Amount must be positive.")
+        return amount.quantize(Decimal('0.01'), rounding=ROUND_HALF_EVEN)
 
 @app.post("/buy_usdt", dependencies=[Depends(validate_api_key)])
 async def buy_usdt(request: BuyRequest):
-    if request.amount <= 0:
-        raise HTTPException(status_code=400, detail="Amount must be positive.")
-
     with SessionFactory() as session:
         users = session.query(User).filter(User.is_working, User.balance >= request.amount).order_by(User.exchange_rate).all()
 
@@ -102,11 +107,11 @@ async def buy_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def receive_buy_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        amount = float(update.message.text.strip())
-        if amount <= 0:
+        amount = Decimal(update.message.text.strip()).quantize(Decimal('0.00'), rounding=ROUND_HALF_EVEN)
+        if amount <= Decimal(0):
             await update.message.reply_text("Некорректная сумма USDT.")
             return
-    except ValueError:
+    except (ValueError, ArithmeticError):
         await update.message.reply_text("Некорректная сумма USDT.")
         return
         
@@ -121,7 +126,7 @@ async def receive_buy_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user.balance += amount
             session.commit()
             
-            await update.message.reply_text(f"Баланс пополнен: {user.balance} USDT.")
+            await update.message.reply_text(f"Баланс пополнен: {user.formatted_balance} USDT.")
         else:
             await update.message.reply_text("Аккаунт не найден.")
             # Must be impossible. Redirect to registration.
@@ -130,7 +135,7 @@ async def receive_buy_usdt(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def change_card_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
-    await update.effective_message.reply_text("Предоставьте новые реквезиты:")
+    await update.effective_message.reply_text("Предоставьте новые реквизиты:")
     await update.effective_message.delete()
     
     return CHANGE_CARD_DETAILS
@@ -168,11 +173,11 @@ async def change_exchange_rate(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def receive_exchange_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        new_exchange_rate = float(update.message.text.strip())
-        if new_exchange_rate <= 0:
+        new_exchange_rate = Decimal(update.message.text.strip()).quantize(Decimal('0.000000'), rounding=ROUND_HALF_EVEN)
+        if new_exchange_rate <= Decimal(0):
             await update.message.reply_text("Некорректный курс.")
             return
-    except ValueError:
+    except (ValueError, ArithmeticError):
         await update.message.reply_text("Некорректный курс.")
         return
     
@@ -185,7 +190,7 @@ async def receive_exchange_rate(update: Update, context: ContextTypes.DEFAULT_TY
         user.exchange_rate = new_exchange_rate
         session.commit()
             
-        await update.message.reply_text(f"Курс обновлен: {new_exchange_rate} ₽.")
+        await update.message.reply_text(f"Курс обновлен: {user.formatted_exchange_rate} ₽.")
         await display_account(update, user, session)
 
     return ConversationHandler.END
@@ -222,9 +227,9 @@ async def stop_work(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await display_account(update, user, session)
 
 async def display_account(update: Update, user: User, session):
-    users = session.query(User).order_by(User.exchange_rate).all()
+    users: List[User] = session.query(User).order_by(User.exchange_rate).all()
     await update.effective_message.reply_text(
-        f"{user.name} | {user.balance} USDT | 1 USDT = {user.exchange_rate} ₽\nРеквизиты: {user.card}\n\nTOP:\n{'\n'.join([f"{user[0]}. {user[1].formatted_name} | {user[1].balance} USDT | 1 USDT = {user[1].exchange_rate} ₽" for user in enumerate(users[:TOP_LENGTH], 1)])}",
+        f"{user.name} | {user.formatted_balance} USDT | 1 USDT = {user.formatted_exchange_rate} ₽\nРеквизиты: {user.card}\n\nTOP:\n{'\n'.join([f"{user[0]}. {user[1].formatted_name} | {user[1].formatted_balance} USDT | 1 USDT = {user[1].formatted_exchange_rate} ₽" for user in enumerate(users[:TOP_LENGTH], 1)])}",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Купить USDT", callback_data=buy_usdt.__name__)],
             [
