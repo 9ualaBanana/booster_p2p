@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import List
 from zoneinfo import ZoneInfo
-from sqlalchemy import desc, or_
+from sqlalchemy import or_
 from config import TOKEN, API_KEY, ACCEPT_ORDER_TIMEOUT, TOP_LENGTH
 from asyncio import run, wait_for
 from decimal import Decimal, ROUND_HALF_EVEN
@@ -16,10 +16,8 @@ from pydantic import BaseModel, field_validator
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ConversationHandler
 from uvicorn import Config, Server
-from order_controller import OrderController
+from order_manager import OrderContext, OrderContextManager
 
-# Add Order confirmation timeout.
-# Define Pydantic models for FastAPI endpoint handlers.
 # Add online status 4 working accounts.
 # Implement username validator decorator.
 # Host with certificates and shit.
@@ -29,9 +27,10 @@ from order_controller import OrderController
 
 # Financial Data Integrity:
 
-# Invalidate expired Orders after server restart according to `created_at`.
-# Process Orders as ACID Transactions.
+# Rollback changes if order processing goes wrong.
 # Ensure concurrency issues are absent.
+# * Invalidate expired Orders after server restart according to `created_at`.
+# * Persist `OrderContext` sessions.
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -60,7 +59,7 @@ async def validate_api_key(x_api_key: str = Header(...)):
     if x_api_key != API_KEY:
         raise HTTPException(status_code=403, detail="Invalid API Key")
 
-class OrderRequest(BaseModel):
+class CreateOrderRequest(BaseModel):
     quantity: Decimal
     
     @field_validator('quantity')
@@ -68,149 +67,141 @@ class OrderRequest(BaseModel):
         if quantity <= Decimal(0):
             raise ValueError("Amount must be positive.")
         return quantity.quantize(Decimal('0.01'), rounding=ROUND_HALF_EVEN)
-    
-class CompleteOrderRequest(BaseModel):
-    order_id: str
-    account_id: int
 
-@app.post("/order", dependencies=[Depends(validate_api_key)])
-async def order(order_request: OrderRequest):
+@app.post("/orders", dependencies=[Depends(validate_api_key)])
+async def order(order_request: CreateOrderRequest):
     with SessionFactory() as session:
-        # Registration process requires users to have @username.
         users = session.query(User).filter(
             User.is_working, 
             or_(~User.orders.any(), ~User.orders.any(Order.status != OrderStatus.COMPLETED)), 
             User.balance >= order_request.quantity
         ).order_by(User.exchange_rate).all()
 
-        for user in users:
-            order = Order(quantity=order_request.quantity, price=user.exchange_rate)
-            user.orders.append(order)
-            session.commit()
-
-            notification = await application.bot.send_message(user.id,
-                                                       f"Запрос на покупку {str(order_request.quantity.quantize(Decimal('0.01'), rounding=ROUND_HALF_EVEN)).rstrip('0').rstrip('.')} USDT\nБаланс: {user.formatted_balance} USDT\nПрибыль: {str((order_request.quantity * user.exchange_rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_EVEN)).rstrip('0').rstrip('.')} ₽",
-                                                       reply_markup=InlineKeyboardMarkup([
-                                                           [InlineKeyboardButton("Принять", callback_data=HandlerNames.ACCEPT_ORDER), InlineKeyboardButton("Отклонить", callback_data=HandlerNames.DECLINE_ORDER)]
-                                                           ]))
-            # Order Processing Session (should be persisted as well)
-            # Add Order ID.
-            order_controller = application.user_data[user.id].setdefault(Order.__name__, OrderController(notification, application.user_data[user.id]))
-
-            try:
-                await wait_for(order_controller.event.wait(), timeout=ACCEPT_ORDER_TIMEOUT)
+    for user in users:
+        try:
+            # `OrderContextManager.context` is None after server reload - it's in-memory so order processing session should be persisted as well.
+            async with await OrderContextManager.get(user.id, application.user_data) as ocm:
+                if ocm.context:
+                    raise EnvironmentError(f"User with all complete order has active {OrderContext.__name__}.")
                 
-                if order_controller := application.user_data[user.id].get(Order.__name__):
-                    order_controller: OrderController
-                    async with order_controller.lock:
-                        session.refresh(user)
+                async with ocm.create_context() as oc:
+                    oc.session.add(user)
+                    order = Order(quantity=order_request.quantity, price=user.exchange_rate)
+                    user.orders.append(order)
+                    oc.session.commit()
+                    oc._order_id = order.id
 
-                        if order.status == OrderStatus.ACCEPTED:
-                            user.balance -= order_request.quantity
-                            user.frozen_balance += order_request.quantity
-                            session.commit()
+                    oc.notification = await application.bot.send_message(user.id,
+                                                        f"Запрос на покупку {str(order_request.quantity.quantize(Decimal('0.01'), rounding=ROUND_HALF_EVEN)).rstrip('0').rstrip('.')} USDT\nБаланс: {user.formatted_balance} USDT\nПрибыль: {str((order_request.quantity * user.exchange_rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_EVEN)).rstrip('0').rstrip('.')} ₽",
+                                                        reply_markup=InlineKeyboardMarkup([
+                                                            [InlineKeyboardButton("Принять", callback_data=HandlerNames.ACCEPT_ORDER), InlineKeyboardButton("Отклонить", callback_data=HandlerNames.DECLINE_ORDER)]
+                                                            ]))
+        except Exception as e:
+            logging.error(f"Error during order creation for user {user.id}: {e}", exc_info=True)
+            continue
 
-                            await order_controller.notification.edit_reply_markup(None)
-                            await order_controller.start_confirmation_waiter()
-                            
-                            return {
-                                "account": {
-                                    "id": user.id,
-                                    "card": user.card
-                                },
-                                "order": {
-                                    "id": order.id,
-                                    "price": order.price,
-                                    "quantity": order.quantity
-                                }
-                            }
-                        elif order.status == OrderStatus.DECLINED:
-                            session.delete(order)
-                            session.commit()
-
-                            await order_controller.notification.delete()
-                            await order_controller.cancel_confirmation_waiter()
-                        else:
-                            pass
-                
-            except TimeoutError:
-                if order_controller := application.user_data[user.id].get(Order.__name__):
-                    order_controller: OrderController
-                    async with order_controller.lock:
-                        session.refresh(user)
-
-                        if order.status == OrderStatus.PENDING:
-                            user.balance -= ORDER_FEE
-                            session.delete(order)
-                            session.commit()
-
-                            await order_controller.notification.edit_text(f"Order {order.id} timed out. Processing fee ({ORDER_FEE} USDT) was deducted.", reply_markup=None)
-                        else:
-                            logging.debug("Handler won RC with timeout.")
+        try:
+            await wait_for(oc.event.wait(), timeout=ACCEPT_ORDER_TIMEOUT)
             
-            # Ends order processing session. Doesn't get executed if OrderStatus.ACCEPTED as it returns.
-            # Shouldn't be popped until Order is finished processing, i.e. session is complete (COMPLETED | FAILED | DECLINED).
-            application.user_data[user.id].pop(Order.__name__)
-            # POST /order -> decline_order -> POST /order
+            async with (await OrderContextManager.get(user.id, application.user_data)).context as oc:
+                if oc.order.status == OrderStatus.ACCEPTED:
+                    return {
+                        "account": {
+                            "id": user.id,
+                            "card": user.card
+                        },
+                        "order": {
+                            "id": oc.order.id,
+                            "price": oc.order.price,
+                            "quantity": oc.order.quantity
+                        }
+                    }
+                else:
+                    logging.error(f"Order with non-accepted status ({oc.order.status}) got through.")
+                    async with await OrderContextManager.get(user.id, application.user_data) as ocm:
+                        ocm.remove_context()
+            
+        except TimeoutError:
+            async with (await OrderContextManager.get(user.id, application.user_data)).context as oc:
+                if oc.order.status == OrderStatus.PENDING:
+                    oc.order.user.balance -= ORDER_FEE
+                    oc.session.delete(order)
+                    oc.session.commit()
+                    await oc.notification.edit_text(f"Время ответа на ордер {oc.order.id} истекло. Сервисная плата ({ORDER_FEE} USDT) была изъята.", reply_markup=None)
 
-        # Define the reason why order can't be completed.
-        # It's either none of the users accepted it or there were no matching users who could complete the order.
-        raise HTTPException(status_code=404, detail="Order can't be completed. None of the users accepted it.")
+                else:
+                    logging.debug("Handler won RC with timeout.")
+
+        except Exception as e:
+            logging.error("Order handling went wrong: {e}", exc_info=True)
+            # Ends order processing session. Doesn't get executed if OrderStatus.ACCEPTED as it returns.
+            async with await OrderContextManager.get(user.id, application.user_data) as ocm:
+                ocm.remove_context()
+            
+        async with await OrderContextManager.get(user.id, application.user_data) as ocm:
+            ocm.remove_context()
+
+    # Define the reason why order can't be completed.
+    # It's either none of the users accepted it or there were no matching users who could complete the order.
+    raise HTTPException(status_code=404, detail="Order can't be completed. None of the users accepted it.")
     
 async def accept_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
 
-    if order_controller := context.user_data.get(Order.__name__):
-        order_controller: OrderController
-        async with order_controller.lock:
-            with SessionFactory() as session:
-                order = session.query(Order).filter_by(user_id=update.effective_user.id).order_by(desc(Order.created_at)).first()
-                if order.status == OrderStatus.PENDING:
-                    order.status = OrderStatus.ACCEPTED
-                    session.commit()
-                    order_controller.event.set()
+    async with (await OrderContextManager.get(update.effective_user.id, application.user_data)).context as oc:
+        if oc.order.status == OrderStatus.PENDING:
+            oc.order.status = OrderStatus.ACCEPTED
+            oc.order.user.balance -= oc.order.quantity
+            oc.order.user.frozen_balance += oc.order.quantity
+            oc.session.commit()
+            await oc.notification.edit_reply_markup(None)
+            await oc.start_confirmation_waiter()
+            oc.event.set()
 
-                    return
-    
-    logging.debug("Timeout won RC with handler.")
+        else:
+            message = f"Order can't be accepted. It has {oc.order.status} status."
+            logging.error(message)
+            await oc.notification.reply_text(message)
 
 async def decline_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
 
-    if order_controller := context.user_data.get(Order.__name__):
-        order_controller: OrderController
-        async with order_controller.lock:
-            with SessionFactory() as session:
-                order = session.query(Order).filter_by(user_id=update.effective_user.id).order_by(desc(Order.created_at)).first()
-                if order.status == OrderStatus.PENDING:
-                    order.status = OrderStatus.DECLINED
-                    session.commit()
-                    order_controller.event.set()
+    async with await OrderContextManager.get(update.effective_user.id, application.user_data) as ocm:
+        async with ocm.context as oc:
+            if oc.order.status == OrderStatus.PENDING:
+                await oc.cancel_confirmation_waiter()
+                oc.session.delete(oc.order)
+                oc.session.commit()
+                await oc.notification.delete()
+                ocm.remove_context()
+                oc.event.set()
 
-                    return
-                
-    logging.debug("Timeout won RC with handler.")
+            else:
+                message = f"Order can't be declined. It has {oc.order.status} status."
+                logging.error(message)
+                await oc.notification.reply_text(message)
     
-@app.patch("/order", dependencies=[Depends(validate_api_key)])
-async def order(request: CompleteOrderRequest):
-    # Assumed that it's the right order controller as it is the only one. Lacks ID validation.
-    if order_controller := application.user_data[request.account_id].get(Order.__name__):
-        order_controller: OrderController
-        async with order_controller.lock:
-            with SessionFactory() as session:
-                order = session.query(Order).filter_by(id=request.order_id).one_or_none()
-                if order and order.id == request.order_id:
-                    if order.status == OrderStatus.ACCEPTED:
-                        order.paid_at = datetime.now(timezone.utc)
-                        session.commit()
 
-                        await application.bot.send_message(order.user.id, f"Клиент оплатил {order.total_price} ₽", reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("Подтвердить", callback_data=HandlerNames.CONFIRM_ORDER), InlineKeyboardButton("Обратиться в тех. поддержку", callback_data=HandlerNames.CALL_SUPPORT)]
-                            ]))
-                    else:
-                        raise HTTPException(status_code=409, detail="Order can't be completed. Conflicting status.")
-                else:
-                    raise HTTPException(status_code=404, detail="Order can't be completed. Order ID mismatch.")
+class CompleteOrderRequest(BaseModel):
+    order_id: str
+    account_id: int
+
+@app.patch("/orders", dependencies=[Depends(validate_api_key)])
+async def order(request: CompleteOrderRequest):
+    async with (await OrderContextManager.get(request.account_id, application.user_data)).context as oc:
+        await oc.cancel_confirmation_waiter()
+        if oc.order.id == request.order_id:
+            if oc.order.status == OrderStatus.ACCEPTED:
+                oc.order.paid_at = datetime.now(timezone.utc)
+                oc.session.commit()
+
+                await application.bot.send_message(oc.order.user.id, f"Клиент оплатил {oc.order.total_price} ₽", reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Подтвердить", callback_data=HandlerNames.CONFIRM_ORDER), InlineKeyboardButton("Обратиться в тех. поддержку", callback_data=HandlerNames.CALL_SUPPORT)]
+                    ]))
+            else:
+                raise HTTPException(status_code=409, detail=f"Order can't be completed. It has {oc.order.status} status.")
+        else:
+            raise HTTPException(status_code=404, detail="Order can't be completed. Wrong order ID.")
         
 async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
@@ -222,39 +213,33 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
 
-    if order_controller := context.user_data.get(Order.__name__):
-        order_controller: OrderController
-        async with order_controller.lock:
-            with SessionFactory() as session:
-                order = session.query(Order).filter_by(user_id=update.effective_user.id).order_by(desc(Order.created_at)).first()
-                await update.effective_message.edit_text(f"Клиент оплатил {order.total_price} ₽", reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Подтвердить", callback_data=HandlerNames.CONFIRM_ORDER), InlineKeyboardButton("Обратиться в тех. поддержку", callback_data=HandlerNames.CALL_SUPPORT)]
-                    ]))
+    async with (await OrderContextManager.get(update.effective_user.id, application.user_data)).context as oc:
+        await update.effective_message.edit_text(f"Клиент оплатил {oc.order.total_price} ₽", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Подтвердить", callback_data=HandlerNames.CONFIRM_ORDER), InlineKeyboardButton("Обратиться в тех. поддержку", callback_data=HandlerNames.CALL_SUPPORT)]
+            ]))
         
 async def complete_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
 
-    if order_controller := context.user_data.get(Order.__name__):
-        order_controller: OrderController
-        async with order_controller.lock:
-            with SessionFactory() as session:
-                order = session.query(Order).filter_by(user_id=update.effective_user.id).order_by(desc(Order.created_at)).first()
-                if order.status == OrderStatus.ACCEPTED:
-                    order.user.frozen_balance -= order.quantity
-                    order.status = OrderStatus.COMPLETED
-                    session.commit()
-                    await update.effective_message.delete()
-                    context.user_data.pop(Order.__name__)
-                    # Send confirmation back to the client.
+    async with (await OrderContextManager.get(update.effective_user.id, application.user_data)).context as oc:
+        if oc.order.status == OrderStatus.ACCEPTED:
+            oc.order.user.frozen_balance -= oc.order.quantity
+            oc.order.status = OrderStatus.COMPLETED
+            oc.session.commit()
+            await update.effective_message.delete()
+            async with await OrderContextManager.get(update.effective_user.id, application.user_data) as ocm:
+                ocm.remove_context()
+            # Send confirmation back to the client.
 
 async def call_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
-    with SessionFactory() as session:
-        order = session.query(Order).filter_by(user_id=update.effective_user.id).order_by(desc(Order.created_at)).first()
-        await update.effective_message.reply_text(f"@techsupport\n\nОрдер ID: {order.id}\n{order.paid_at.astimezone(ZoneInfo("Europe/Moscow"))}")
+
+    async with (await OrderContextManager.get(update.effective_user.id, application.user_data)).context as oc:
+        await update.effective_message.reply_markdown_v2(f"@techsupport\n\n*Ордер ID*: `{oc.order.id}`\n*Время оплаты*: `{oc.order.paid_at.astimezone(ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%d %H:%M:%S")}`")
     
 async def order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
+
     await update.effective_message.reply_text("Сколько USDT вы хотите купить?")
     await update.effective_message.delete()
     
