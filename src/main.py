@@ -95,7 +95,7 @@ async def order(order_request: OrderRequest):
                                                            ]))
             # Order Processing Session (should be persisted as well)
             # Add Order ID.
-            order_controller = application.user_data[user.id].setdefault(Order.__name__, OrderController(notification))
+            order_controller = application.user_data[user.id].setdefault(Order.__name__, OrderController(notification, application.user_data[user.id]))
 
             try:
                 await wait_for(order_controller.event.wait(), timeout=ACCEPT_ORDER_TIMEOUT)
@@ -111,6 +111,7 @@ async def order(order_request: OrderRequest):
                             session.commit()
 
                             await order_controller.notification.edit_reply_markup(None)
+                            await order_controller.start_confirmation_waiter()
                             
                             return {
                                 "account": {
@@ -128,6 +129,7 @@ async def order(order_request: OrderRequest):
                             session.commit()
 
                             await order_controller.notification.delete()
+                            await order_controller.cancel_confirmation_waiter()
                         else:
                             pass
                 
