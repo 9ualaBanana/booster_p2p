@@ -244,6 +244,7 @@ async def complete_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     order.status = OrderStatus.COMPLETED
                     session.commit()
                     await update.effective_message.delete()
+                    context.user_data.pop(Order.__name__)
                     # Send confirmation back to the client.
 
 async def call_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
