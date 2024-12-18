@@ -124,16 +124,12 @@ async def order(order_request: CreateOrderRequest):
                             "quantity": oc.order.quantity
                         }
                     }
-                else:
-                    logging.error(f"Order with non-accepted status ({oc.order.status}) got through.")
-                    async with await OrderContextManager.get(user.id, application.user_data) as ocm:
-                        ocm.remove_context()
         
         except TimeoutError:
             async with (await OrderContextManager.get(user.id, application.user_data)).context as oc:
                 if oc.order.status == OrderStatus.PENDING:
                     oc.order.user.balance -= ORDER_FEE
-                    oc.session.delete(order)
+                    oc.session.delete(oc.order)
                     oc.session.commit()
                     await oc.notification.edit_text(f"Время ответа на ордер {oc.order.id} истекло. Сервисная плата ({ORDER_FEE} USDT) была изъята.", reply_markup=None)
                     logging.info(f"Order {oc.order.id} timed out for user {user.id}")
@@ -167,8 +163,8 @@ async def accept_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             oc.session.commit()
             await oc.notification.edit_reply_markup(None)
             await oc.start_confirmation_waiter()
-            await context.bot.send_message(SUPPORT_ID, f"Ордер ID: {oc.order.id}\nСтоимость: {oc.order.total_price}\nКонтрагент: @{update.effective_user.username}", reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Да ID", callback_data=f"{HandlerNames.YES_SUPPORT}|{oc.order.user_id}"), InlineKeyboardButton("Нет ID", callback_data=f"{HandlerNames.HANDLE_ORDER}|{oc.order.user_id}")]
+            oc.support_message = await context.bot.send_message(SUPPORT_ID, f"Ордер ID: {oc.order.id}\nСтоимость: {oc.order.total_price}\nКонтрагент: @{update.effective_user.username}", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Да ID", callback_data=f"{HandlerNames.YES_SUPPORT}|{oc.order.user_id}"), InlineKeyboardButton("Нет ID", callback_data=f"{HandlerNames.NO_SUPPORT}|{oc.order.user_id}")]
                 ]))
             oc.event.set()
 
@@ -187,10 +183,9 @@ async def decline_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logging.info(f"Order {oc.order.id} declined by user {update.effective_user.id}")
                 await oc.cancel_confirmation_waiter()
                 oc.session.delete(oc.order)
+                oc._order_id = None
                 oc.session.commit()
                 await oc.notification.delete()
-                await oc.support_message.delete()
-                ocm.remove_context()
                 oc.event.set()
 
             else:
@@ -233,6 +228,7 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]))
     
 async def handle_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info(f"Order handling requested for order {update.effective_message.text}")
     await update.callback_query.answer()
 
     async with (await OrderContextManager.get(update.effective_user.id, application.user_data)).context as oc:
@@ -499,20 +495,14 @@ async def main():
     application.add_handlers([CallbackQueryHandler(accept_order, pattern=HandlerNames.ACCEPT_ORDER), CallbackQueryHandler(decline_order, pattern=HandlerNames.DECLINE_ORDER)])
     application.add_handlers([CallbackQueryHandler(start_work, pattern=HandlerNames.START_WORK), CallbackQueryHandler(stop_work, pattern=HandlerNames.STOP_WORK)])
     application.add_handlers([CallbackQueryHandler(handle_order, pattern=HandlerNames.HANDLE_ORDER), CallbackQueryHandler(confirm_order, pattern=HandlerNames.CONFIRM_ORDER), CallbackQueryHandler(complete_order, pattern=HandlerNames.COMPLETE_ORDER), CallbackQueryHandler(call_support, pattern=HandlerNames.CALL_SUPPORT)])
-    application.add_handlers([CallbackQueryHandler(yes_support, pattern=f"{HandlerNames.YES_SUPPORT}\|(\d+)"), CallbackQueryHandler(no_support, pattern=f"{HandlerNames.NO_SUPPORT}\|(\d+)")])
+    application.add_handlers([CallbackQueryHandler(yes_support, pattern=f"{HandlerNames.YES_SUPPORT}|(d+)"), CallbackQueryHandler(no_support, pattern=f"{HandlerNames.NO_SUPPORT}|(d+)")])
 
     # Both servers .start() and not .run() so to not block the event loop on which they both must run.
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
-    # await application.updater.start_webhook(listen="localhost", port=80,
-    #                                         webhook_url="https://1052-171-225-184-254.ngrok-free.app",
-    #                                         cert="",
-    #                                         key="")
 
     await Server(Config(app)).serve()
     
-    
-
 if __name__ == '__main__':
     run(main())
