@@ -16,7 +16,7 @@ class OrderContext:
         self.session = None
         self.notification: Message = None
         self.support_message: Message = None
-        self._confirmation_waiter = None
+        self._client_completion_waiter = None
         self._ocm = ocm
 
     async def __aenter__(self) -> Self:
@@ -43,16 +43,16 @@ class OrderContext:
                 self.session = None
             self._lock.release()
 
-    async def start_confirmation_waiter(self):
-        self._confirmation_waiter = create_task(self.order_confirmation_waiter())
+    async def start_client_completion_waiter(self):
+        self._client_completion_waiter = create_task(self.client_completion_waiter())
 
-    async def cancel_confirmation_waiter(self):
+    async def cancel_client_completion_waiter(self):
         try:
-            self._confirmation_waiter.cancel()
+            self._client_completion_waiter.cancel()
         except:
             pass
 
-    async def order_confirmation_waiter(self):
+    async def client_completion_waiter(self):
         try:
             await sleep(FROZEN_BALANCE_COOLDOWN)
             async with self:
@@ -93,7 +93,6 @@ class OrderContextManager:
     async def __aexit__(self, exc_type, exc_value, traceback):
         self._lock.release()
     
-    # Ensure it doesn't mess with active orders recognition.
     @property
     def context(self) -> Optional[OrderContext]:
         return self.user_data[self.id].get(OrderContext.__name__)

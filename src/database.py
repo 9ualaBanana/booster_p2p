@@ -12,6 +12,7 @@ Base = declarative_base()
 class OrderStatus(str, Enum):
     PENDING = "pending"
     ACCEPTED = "accepted"
+    DECLINED = "declined"
     COMPLETED = "completed"
 
 class User(Base):
