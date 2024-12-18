@@ -3,7 +3,7 @@ from enum import Enum
 from typing import List
 from zoneinfo import ZoneInfo
 from sqlalchemy import or_
-from config import TOKEN, API_KEY, ACCEPT_ORDER_TIMEOUT, TOP_LENGTH
+from config import SUPPORT_ID, TOKEN, API_KEY, ACCEPT_ORDER_TIMEOUT, TOP_LENGTH
 from asyncio import run, wait_for
 from decimal import Decimal, ROUND_HALF_EVEN
 from typing import List
@@ -49,6 +49,8 @@ class HandlerNames(str, Enum):
     COMPLETE_ORDER = "complete_order"
     CONFIRM_ORDER = "confirm_order"
     CALL_SUPPORT = "call_support"
+    YES_SUPPORT = "yes_support"
+    NO_SUPPORT = "no_support"
     START_WORK = "start_work"
     STOP_WORK = "stop_work"
 
@@ -156,6 +158,9 @@ async def accept_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             oc.session.commit()
             await oc.notification.edit_reply_markup(None)
             await oc.start_confirmation_waiter()
+            await context.bot.send_message(SUPPORT_ID, f"Ордер ID: {oc.order.id}\nСтоимость: {oc.order.total_price}\nКонтрагент: @{update.effective_user.username}", reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Да ID", callback_data=f"{HandlerNames.YES_SUPPORT}|{oc.order.user_id}"), InlineKeyboardButton("Нет ID", callback_data=f"{HandlerNames.HANDLE_ORDER}|{oc.order.user_id}")]
+                ]))
             oc.event.set()
 
         else:
@@ -173,6 +178,7 @@ async def decline_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 oc.session.delete(oc.order)
                 oc.session.commit()
                 await oc.notification.delete()
+                await oc.support_message.delete()
                 ocm.remove_context()
                 oc.event.set()
 
@@ -236,6 +242,33 @@ async def call_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async with (await OrderContextManager.get(update.effective_user.id, application.user_data)).context as oc:
         await update.effective_message.reply_markdown_v2(f"@techsupport\n\n*Ордер ID*: `{oc.order.id}`\n*Время оплаты*: `{oc.order.paid_at.astimezone(ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%d %H:%M:%S")}`")
+
+async def yes_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+
+    async with (await OrderContextManager.get(int(update.callback_query.data.split('|')[-1]), application.user_data)).context as oc:
+        if oc.order.status == OrderStatus.ACCEPTED and oc.order.paid_at:
+            oc.order.user.frozen_balance -= oc.order.quantity
+            oc.order.status = OrderStatus.COMPLETED
+            oc.session.commit()
+            await update.effective_message.delete()
+            async with await OrderContextManager.get(update.effective_user.id, application.user_data) as ocm:
+                ocm.remove_context()
+            # Send confirmation back to the client.
+
+async def no_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+
+    async with (await OrderContextManager.get(int(update.callback_query.data.split('|')[-1]), application.user_data)).context as oc:
+        if oc.order.status == OrderStatus.ACCEPTED:
+            oc.order.user.frozen_balance -= oc.order.quantity
+            oc.order.user.balance += oc.order.quantity
+            oc.session.delete(oc.order)
+            oc.session.commit()
+            await update.effective_message.delete()
+            async with await OrderContextManager.get(update.effective_user.id, application.user_data) as ocm:
+                ocm.remove_context()
+            # Send rejection back to the client.
     
 async def order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
@@ -434,6 +467,7 @@ async def main():
     application.add_handlers([CallbackQueryHandler(accept_order, pattern=HandlerNames.ACCEPT_ORDER), CallbackQueryHandler(decline_order, pattern=HandlerNames.DECLINE_ORDER)])
     application.add_handlers([CallbackQueryHandler(start_work, pattern=HandlerNames.START_WORK), CallbackQueryHandler(stop_work, pattern=HandlerNames.STOP_WORK)])
     application.add_handlers([CallbackQueryHandler(handle_order, pattern=HandlerNames.HANDLE_ORDER), CallbackQueryHandler(confirm_order, pattern=HandlerNames.CONFIRM_ORDER), CallbackQueryHandler(complete_order, pattern=HandlerNames.COMPLETE_ORDER), CallbackQueryHandler(call_support, pattern=HandlerNames.CALL_SUPPORT)])
+    application.add_handlers([CallbackQueryHandler(yes_support, pattern=f"{HandlerNames.YES_SUPPORT}\|(\d+)"), CallbackQueryHandler(no_support, pattern=f"{HandlerNames.NO_SUPPORT}\|(\d+)")])
 
     # Both servers .start() and not .run() so to not block the event loop on which they both must run.
     await application.initialize()

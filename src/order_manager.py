@@ -15,6 +15,7 @@ class OrderContext:
         self.event = Event()
         self.session = None
         self.notification: Message = None
+        self.support_message: Message = None
         self._confirmation_waiter = None
         self._ocm = ocm
 
