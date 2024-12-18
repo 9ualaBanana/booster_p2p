@@ -1,41 +1,45 @@
+from asyncio import run, wait_for
+import logging
+import json
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ConversationHandler
+from fastapi import FastAPI, HTTPException, Header, Depends
+from uvicorn import Config, Server
+from config import SUPPORT_ID, TOKEN, API_KEY, ACCEPT_ORDER_TIMEOUT, TOP_LENGTH, ORDER_FEE
 from datetime import datetime, timezone
 from enum import Enum
 from typing import List
 from zoneinfo import ZoneInfo
 from sqlalchemy import or_
-from config import SUPPORT_ID, TOKEN, API_KEY, ACCEPT_ORDER_TIMEOUT, TOP_LENGTH
-from asyncio import run, wait_for
 from decimal import Decimal, ROUND_HALF_EVEN
 from typing import List
-from config import TOKEN, API_KEY, ACCEPT_ORDER_TIMEOUT, TOP_LENGTH, ORDER_FEE
 from creditcard import CreditCard
 from database import OrderStatus, SessionFactory, User, Order
-from fastapi import FastAPI, HTTPException, Header, Depends
-import logging
 from pydantic import BaseModel, field_validator
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ConversationHandler
-from uvicorn import Config, Server
 from order_manager import OrderContext, OrderContextManager
 
-# Add online status 4 working accounts.
-# Implement username validator decorator.
-# Host with certificates and shit.
-# Ensure .env is reloadable.
-# Prettyprint user account details on /start.
-# Upgrade auth to JWT?
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        log_data = {
+            "time": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "message": record.getMessage(),
+            "name": record.name,
+            "filename": record.filename,
+            "lineno": record.lineno,
+            "funcName": record.funcName,
+            "process": record.process,
+            "thread": record.thread,
+        }
+        if record.exc_info:
+            log_data["exc_info"] = self.formatException(record.exc_info)
+        return json.dumps(log_data)
 
-# Financial Data Integrity:
 
-# Rollback changes if order processing goes wrong.
-# Ensure concurrency issues are absent.
-# * Invalidate expired Orders after server restart according to `created_at`.
-# * Persist `OrderContext` sessions.
-
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+formatter = JsonFormatter()
+for handler in logging.root.handlers:
+   handler.setFormatter(formatter)
 
 CHANGE_EXCHANGE_RATE, CHANGE_CARD_DETAILS, ORDER = range(3)
 
@@ -63,7 +67,7 @@ async def validate_api_key(x_api_key: str = Header(...)):
 
 class CreateOrderRequest(BaseModel):
     quantity: Decimal
-    
+
     @field_validator('quantity')
     def validate_amount(cls, quantity):
         if quantity <= Decimal(0):
@@ -72,6 +76,7 @@ class CreateOrderRequest(BaseModel):
 
 @app.post("/orders", dependencies=[Depends(validate_api_key)])
 async def order(order_request: CreateOrderRequest):
+    logging.info(f"Order requested with quantity: {order_request.quantity}")
     with SessionFactory() as session:
         users = session.query(User).filter(
             User.is_working, 
@@ -81,7 +86,7 @@ async def order(order_request: CreateOrderRequest):
 
     for user in users:
         try:
-            # `OrderContextManager.context` is None after server reload - it's in-memory so order processing session should be persisted as well.
+            logging.info(f"Attempting order creation for user {user.id}")
             async with await OrderContextManager.get(user.id, application.user_data) as ocm:
                 if ocm.context:
                     raise EnvironmentError(f"User with all complete order has active {OrderContext.__name__}.")
@@ -104,9 +109,10 @@ async def order(order_request: CreateOrderRequest):
 
         try:
             await wait_for(oc.event.wait(), timeout=ACCEPT_ORDER_TIMEOUT)
-            
+        
             async with (await OrderContextManager.get(user.id, application.user_data)).context as oc:
                 if oc.order.status == OrderStatus.ACCEPTED:
+                    logging.info(f"Order accepted for user {user.id} with order_id {oc.order.id}")
                     return {
                         "account": {
                             "id": user.id,
@@ -122,7 +128,7 @@ async def order(order_request: CreateOrderRequest):
                     logging.error(f"Order with non-accepted status ({oc.order.status}) got through.")
                     async with await OrderContextManager.get(user.id, application.user_data) as ocm:
                         ocm.remove_context()
-            
+        
         except TimeoutError:
             async with (await OrderContextManager.get(user.id, application.user_data)).context as oc:
                 if oc.order.status == OrderStatus.PENDING:
@@ -130,28 +136,31 @@ async def order(order_request: CreateOrderRequest):
                     oc.session.delete(order)
                     oc.session.commit()
                     await oc.notification.edit_text(f"Время ответа на ордер {oc.order.id} истекло. Сервисная плата ({ORDER_FEE} USDT) была изъята.", reply_markup=None)
+                    logging.info(f"Order {oc.order.id} timed out for user {user.id}")
 
                 else:
-                    logging.debug("Handler won RC with timeout.")
+                     logging.debug("Handler won RC with timeout.")
 
         except Exception as e:
             logging.error("Order handling went wrong: {e}", exc_info=True)
-            # Ends order processing session. Doesn't get executed if OrderStatus.ACCEPTED as it returns.
             async with await OrderContextManager.get(user.id, application.user_data) as ocm:
                 ocm.remove_context()
-            
+        
         async with await OrderContextManager.get(user.id, application.user_data) as ocm:
             ocm.remove_context()
 
     # Define the reason why order can't be completed.
     # It's either none of the users accepted it or there were no matching users who could complete the order.
+    logging.info("Order can't be completed. None of the users accepted it.")
     raise HTTPException(status_code=404, detail="Order can't be completed. None of the users accepted it.")
-    
+
 async def accept_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info(f"User {update.effective_user.id} attempting to accept order")
     await update.callback_query.answer()
 
     async with (await OrderContextManager.get(update.effective_user.id, application.user_data)).context as oc:
         if oc.order.status == OrderStatus.PENDING:
+            logging.info(f"Order {oc.order.id} accepted by user {update.effective_user.id}")
             oc.order.status = OrderStatus.ACCEPTED
             oc.order.user.balance -= oc.order.quantity
             oc.order.user.frozen_balance += oc.order.quantity
@@ -169,11 +178,13 @@ async def accept_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await oc.notification.reply_text(message)
 
 async def decline_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info(f"User {update.effective_user.id} attempting to decline order")
     await update.callback_query.answer()
 
     async with await OrderContextManager.get(update.effective_user.id, application.user_data) as ocm:
         async with ocm.context as oc:
             if oc.order.status == OrderStatus.PENDING:
+                logging.info(f"Order {oc.order.id} declined by user {update.effective_user.id}")
                 await oc.cancel_confirmation_waiter()
                 oc.session.delete(oc.order)
                 oc.session.commit()
@@ -186,7 +197,7 @@ async def decline_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 message = f"Order can't be declined. It has {oc.order.status} status."
                 logging.error(message)
                 await oc.notification.reply_text(message)
-    
+
 
 class CompleteOrderRequest(BaseModel):
     order_id: str
@@ -194,22 +205,27 @@ class CompleteOrderRequest(BaseModel):
 
 @app.patch("/orders", dependencies=[Depends(validate_api_key)])
 async def order(request: CompleteOrderRequest):
+    logging.info(f"Attempting to complete order {request.order_id} for account {request.account_id}")
     async with (await OrderContextManager.get(request.account_id, application.user_data)).context as oc:
         await oc.cancel_confirmation_waiter()
         if oc.order.id == request.order_id:
             if oc.order.status == OrderStatus.ACCEPTED:
                 oc.order.paid_at = datetime.now(timezone.utc)
                 oc.session.commit()
+                logging.info(f"Order {request.order_id} set to paid for account {request.account_id}")
 
                 await application.bot.send_message(oc.order.user.id, f"Клиент оплатил {oc.order.total_price} ₽", reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("Подтвердить", callback_data=HandlerNames.CONFIRM_ORDER), InlineKeyboardButton("Обратиться в тех. поддержку", callback_data=HandlerNames.CALL_SUPPORT)]
                     ]))
             else:
+                logging.error(f"Order can't be completed. It has {oc.order.status} status.")
                 raise HTTPException(status_code=409, detail=f"Order can't be completed. It has {oc.order.status} status.")
         else:
+            logging.error(f"Order can't be completed. Wrong order ID for account {request.account_id}")
             raise HTTPException(status_code=404, detail="Order can't be completed. Wrong order ID.")
-        
+    
 async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info(f"Order confirmation requested for order {update.effective_message.text}")
     await update.callback_query.answer()
     
     await update.effective_message.edit_text(f"{update.effective_message.text}\n\nВы уверены?", reply_markup=InlineKeyboardMarkup([
@@ -225,10 +241,12 @@ async def handle_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]))
         
 async def complete_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info(f"Order completion requested for order {update.effective_message.text}")
     await update.callback_query.answer()
 
     async with (await OrderContextManager.get(update.effective_user.id, application.user_data)).context as oc:
         if oc.order.status == OrderStatus.ACCEPTED:
+            logging.info(f"Order {oc.order.id} completed for user {update.effective_user.id}")
             oc.order.user.frozen_balance -= oc.order.quantity
             oc.order.status = OrderStatus.COMPLETED
             oc.session.commit()
@@ -238,16 +256,19 @@ async def complete_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Send confirmation back to the client.
 
 async def call_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info(f"Support call requested for order {update.effective_message.text}")
     await update.callback_query.answer()
 
     async with (await OrderContextManager.get(update.effective_user.id, application.user_data)).context as oc:
         await update.effective_message.reply_markdown_v2(f"@techsupport\n\n*Ордер ID*: `{oc.order.id}`\n*Время оплаты*: `{oc.order.paid_at.astimezone(ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%d %H:%M:%S")}`")
 
 async def yes_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info(f"Yes support called with {update.callback_query.data}")
     await update.callback_query.answer()
 
     async with (await OrderContextManager.get(int(update.callback_query.data.split('|')[-1]), application.user_data)).context as oc:
         if oc.order.status == OrderStatus.ACCEPTED and oc.order.paid_at:
+            logging.info(f"Order {oc.order.id} completed by support for user {update.effective_user.id}")
             oc.order.user.frozen_balance -= oc.order.quantity
             oc.order.status = OrderStatus.COMPLETED
             oc.session.commit()
@@ -257,10 +278,12 @@ async def yes_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Send confirmation back to the client.
 
 async def no_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info(f"No support called with {update.callback_query.data}")
     await update.callback_query.answer()
 
     async with (await OrderContextManager.get(int(update.callback_query.data.split('|')[-1]), application.user_data)).context as oc:
         if oc.order.status == OrderStatus.ACCEPTED:
+            logging.info(f"Order {oc.order.id} rejected by support for user {update.effective_user.id}")
             oc.order.user.frozen_balance -= oc.order.quantity
             oc.order.user.balance += oc.order.quantity
             oc.session.delete(oc.order)
@@ -271,6 +294,7 @@ async def no_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Send rejection back to the client.
     
 async def order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info(f"User {update.effective_user.id} requested to start order")
     await update.callback_query.answer()
 
     await update.effective_message.reply_text("Сколько USDT вы хотите купить?")
@@ -299,7 +323,7 @@ async def receive_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user:
             user.balance += amount
             session.commit()
-            
+            logging.info(f"User {user.id} balance updated with {amount}")
             await update.message.reply_text(f"Баланс пополнен: {user.formatted_balance} USDT.")
         else:
             await update.message.reply_text("Аккаунт не найден.")
@@ -308,6 +332,7 @@ async def receive_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def change_card_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info(f"User {update.effective_user.id} requested to change card details")
     await update.callback_query.answer()
     await update.effective_message.reply_text("Предоставьте новые реквизиты:")
     await update.effective_message.delete()
@@ -325,12 +350,14 @@ async def receive_card_details(update: Update, context: ContextTypes.DEFAULT_TYP
                     user = context.user_data.get('new_user', None)
                     if user is not None:
                         user.card = card.number
+                        logging.info(f"User card details changed to {card.number}")
                         await update.message.reply_text(f"Реквизиты успешно изменены {card.number}.")
                         await update.effective_message.reply_text("Предоставьте новый курс:")
                         return CHANGE_EXCHANGE_RATE
                 else:
                     user.card = card.number
                     session.commit()
+                    logging.info(f"User card details changed to {card.number}")
                     await update.message.reply_text(f"Реквизиты успешно изменены {card.number}.")
                     await display_account(update, user, session)
 
@@ -339,6 +366,7 @@ async def receive_card_details(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text("Предоставленные реквезиты некорректны.")
 
 async def change_exchange_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info(f"User {update.effective_user.id} requested to change exchange rate")
     await update.callback_query.answer()
     await update.effective_message.reply_text("Предоставьте новый курс:")
     await update.effective_message.delete()
@@ -364,12 +392,14 @@ async def receive_exchange_rate(update: Update, context: ContextTypes.DEFAULT_TY
         user.exchange_rate = new_exchange_rate
         session.commit()
             
+        logging.info(f"User {user.id} exchange rate changed to {new_exchange_rate}")
         await update.message.reply_text(f"Курс обновлен: {user.formatted_exchange_rate} ₽.")
         await display_account(update, user, session)
 
     return ConversationHandler.END
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info(f"User {update.effective_user.id} started bot")
     with SessionFactory() as session:
         user = session.query(User).filter_by(id=update.effective_user.id).one_or_none()
 
@@ -386,6 +416,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     
 async def start_work(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info(f"User {update.effective_user.id} started work")
     with SessionFactory() as session:
         user = session.query(User).filter_by(id=update.effective_user.id).one()
         user.is_working = True
@@ -395,6 +426,7 @@ async def start_work(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await display_account(update, user, session)
 
 async def stop_work(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logging.info(f"User {update.effective_user.id} stopped work")
     with SessionFactory() as session:
         user = session.query(User).filter_by(id=update.effective_user.id).one()
         user.is_working = False
