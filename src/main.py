@@ -3,6 +3,7 @@ import logging
 import json
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ConversationHandler
+from telegram.helpers import escape_markdown as md
 from fastapi import FastAPI, HTTPException, Header, Depends
 from uvicorn import Config, Server
 from config import SUPPORT_ID, TOKEN, API_KEY, ACCEPT_ORDER_TIMEOUT, TOP_LENGTH, ORDER_FEE
@@ -16,6 +17,7 @@ from typing import List
 from creditcard import CreditCard
 from database import OrderStatus, SessionFactory, User, Order
 from pydantic import BaseModel, field_validator
+from formatting_helper import FormattingHelper
 from order_manager import OrderContext, OrderContextManager
 
 class JsonFormatter(logging.Formatter):
@@ -100,10 +102,11 @@ async def order(order_request: CreateOrderRequest):
                     oc._order_id = order.id
 
                     oc.notification = await application.bot.send_message(user.id,
-                                                        f"Запрос на покупку {str(order_request.quantity.quantize(Decimal('0.01'), rounding=ROUND_HALF_EVEN)).rstrip('0').rstrip('.')} USDT\nБаланс: {user.formatted_balance} USDT\nПрибыль: {str((order_request.quantity * user.exchange_rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_EVEN)).rstrip('0').rstrip('.')} ₽",
+                                                        f"Запрос на покупку *{md(FormattingHelper.quantize(order_request.quantity, 8), version=2)}* USDT\nБаланс: *{md(user.formatted_balance, version=2)}* USDT\nПрибыль: *{md(FormattingHelper.quantize(order_request.quantity * user.exchange_rate, 2), version=2)}* ₽",
                                                         reply_markup=InlineKeyboardMarkup([
                                                             [InlineKeyboardButton("Принять", callback_data=HandlerNames.ACCEPT_ORDER), InlineKeyboardButton("Отклонить", callback_data=HandlerNames.DECLINE_ORDER)]
-                                                            ]))
+                                                            ]),
+                                                            parse_mode="MarkdownV2")
         except Exception as e:
             logging.error(f"Error during order creation for user {user.name} ({user.id}): {e}", exc_info=True)
             continue
@@ -147,7 +150,7 @@ async def order(order_request: CreateOrderRequest):
                     oc.session.delete(oc.order)
                     oc.session.commit()
 
-                    await oc.notification.edit_text(f"Время ответа на ордер {oc.order.id} истекло. Сервисная плата ({ORDER_FEE} USDT) была изъята.", reply_markup=None)
+                    await oc.notification.edit_text(f"Время ответа на ордер `{md(oc.order.id, version=2)}` истекло\nСервисная плата в размере *{md(FormattingHelper.quantize(ORDER_FEE, 8), version=2)}* USDT была изъята", reply_markup=None, parse_mode="MarkdownV2")
 
                 else:
                     logging.warning(f"Handled order ({oc.order.id}) somehow reached timeout.")
@@ -173,9 +176,10 @@ async def accept_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             oc.session.commit()
 
             await oc.notification.edit_reply_markup(None)
-            oc.support_message = await context.bot.send_message(SUPPORT_ID, f"Ордер ID: {oc.order.id}\nСтоимость: {oc.order.total_price}\nКонтрагент: @{update.effective_user.username}", reply_markup=InlineKeyboardMarkup([
+            oc.support_message = await context.bot.send_message(SUPPORT_ID, f"Ордер ID: `{md(oc.order.id, version=2)}`\nСтоимость: *{md(FormattingHelper.quantize(oc.order.total_price, 2), version=2)}* ₽\nКонтрагент: @{update.effective_user.username}", reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("Да ID", callback_data=f"{HandlerNames.YES_SUPPORT}|{oc.order.user_id}"), InlineKeyboardButton("Нет ID", callback_data=f"{HandlerNames.NO_SUPPORT}|{oc.order.user_id}")]
-                ]))
+                ]),
+                parse_mode="MarkdownV2")
             
             oc.event.set()
 
@@ -213,9 +217,10 @@ async def order(request: CompleteOrderRequest):
                 oc.order.paid_at = datetime.now(timezone.utc)
                 oc.session.commit()
 
-                await application.bot.send_message(oc.order.user.id, f"Клиент оплатил {oc.order.total_price} ₽", reply_markup=InlineKeyboardMarkup([
+                await application.bot.send_message(oc.order.user.id, f"Клиент оплатил *{md(FormattingHelper.quantize(oc.order.total_price, 2), version=2)}* ₽", reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("Подтвердить", callback_data=HandlerNames.CONFIRM_ORDER), InlineKeyboardButton("Обратиться в тех. поддержку", callback_data=HandlerNames.CALL_SUPPORT)]
-                    ]))
+                    ]),
+                    parse_mode="MarkdownV2")
             else:
                 message = f"Active order {oc.order.id} can't be completed. It has {oc.order.status} status."
                 logging.error(message)
@@ -228,18 +233,20 @@ async def order(request: CompleteOrderRequest):
 async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     
-    await update.effective_message.edit_text(f"{update.effective_message.text}\n\nВы уверены?", reply_markup=InlineKeyboardMarkup([
+    await update.effective_message.edit_text(f"{update.effective_message.text_markdown_v2}\n\nВы уверены?", reply_markup=InlineKeyboardMarkup([
         [InlineKeyboardButton("Да", callback_data=HandlerNames.COMPLETE_ORDER), InlineKeyboardButton("Нет", callback_data=HandlerNames.HANDLE_ORDER)]
-        ]))
+        ]),
+        parse_mode="MarkdownV2")
     
 async def handle_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info(f"Order handling requested for order {update.effective_message.text}")
     await update.callback_query.answer()
 
     async with (await OrderContextManager.get(update.effective_user.id, application.user_data)).context as oc:
-        await update.effective_message.edit_text(f"Клиент оплатил {oc.order.total_price} ₽", reply_markup=InlineKeyboardMarkup([
+        await update.effective_message.edit_text(f"Клиент оплатил *{md(FormattingHelper.quantize(oc.order.total_price, 2), version=2)}* ₽", reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Подтвердить", callback_data=HandlerNames.CONFIRM_ORDER), InlineKeyboardButton("Обратиться в тех. поддержку", callback_data=HandlerNames.CALL_SUPPORT)]
-            ]))
+            ]),
+            parse_mode="MarkdownV2")
         
 async def complete_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
@@ -304,7 +311,7 @@ async def order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def receive_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        amount = Decimal(update.message.text.strip()).quantize(Decimal('0.00'), rounding=ROUND_HALF_EVEN)
+        amount = Decimal(update.message.text.strip()).quantize(Decimal('0.01'), rounding=ROUND_HALF_EVEN)
         if amount <= Decimal(0):
             await update.message.reply_text("Некорректная сумма USDT.")
             return
@@ -375,7 +382,7 @@ async def change_exchange_rate(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def receive_exchange_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        new_exchange_rate = Decimal(update.message.text.strip()).quantize(Decimal('0.000000'), rounding=ROUND_HALF_EVEN)
+        new_exchange_rate = Decimal(update.message.text.strip()).quantize(Decimal('0.000001'), rounding=ROUND_HALF_EVEN)
         if new_exchange_rate <= Decimal(0):
             await update.message.reply_text("Некорректный курс.")
             return
@@ -437,8 +444,8 @@ async def stop_work(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def display_account(update: Update, user: User, session):
     users: List[User] = session.query(User).order_by(User.exchange_rate).all()
-    await update.effective_message.reply_text(
-        f"{user.name} | {user.formatted_balance} USDT | 1 USDT = {user.formatted_exchange_rate} ₽\nРеквизиты: {user.card}\n\nTOP:\n{'\n'.join([f"{user[0]}. {user[1].formatted_name} | {user[1].formatted_balance} USDT | 1 USDT = {user[1].formatted_exchange_rate} ₽" for user in enumerate(users[:TOP_LENGTH], 1)])}",
+    await update.effective_message.reply_markdown_v2(
+        f"{user.name} | *{user.formatted_balance}* USDT | 1 USDT = *{user.formatted_exchange_rate}* ₽\nРеквизиты: `{user.card}`\n\n*TOP*:\n{'\n'.join([f"{user[0]}. {user[1].formatted_name} | *{user[1].formatted_balance}* USDT | 1 USDT = *{user[1].formatted_exchange_rate}* ₽" for user in enumerate(users[:TOP_LENGTH], 1)])}",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Купить USDT", callback_data=order.__name__)],
             [

@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from typing import List
 from enum import Enum
 
+from formatting_helper import FormattingHelper
+
 Base = declarative_base()
 
 class OrderStatus(str, Enum):
@@ -39,15 +41,15 @@ class User(Base):
     
     @property
     def formatted_exchange_rate(self) -> str:
-        return str(self.exchange_rate.quantize(Decimal('0.01'), rounding=ROUND_HALF_EVEN)).rstrip('0').rstrip('.')
+        return FormattingHelper.quantize(self.exchange_rate, 2)
     
     @property
     def formatted_balance(self) -> str:
-        return str(self.balance.quantize(Decimal('0.000001'), rounding=ROUND_HALF_EVEN)).rstrip('0').rstrip('.')
+        return FormattingHelper.quantize(self.balance, 8)
     
     @property
     def formatted_frozen_balance(self) -> str:
-        return str(self.frozen_balance.quantize(Decimal('0.000001'), rounding=ROUND_HALF_EVEN)).rstrip('0').rstrip('.')
+        return FormattingHelper.quantize(self.frozen_balance, 8)
 
 class Order(Base):
     __tablename__ = 'orders'

@@ -63,7 +63,7 @@ class OrderContext:
                     self.session.delete(order)
                     self.session.commit()
                     self._ocm.remove_context()
-                    await self.notification.edit_text(f"{self.notification.text}\n\nКлиент не совершил перевод по ордеру вовремя.\nОрдер отменён. Баланс разморожен.")
+                    await self.notification.edit_text(f"{self.notification.text_markdown_v2}\n\nКлиент не совершил перевод по ордеру вовремя\nОрдер отменён\nБаланс разморожен", parse_mode="MarkdownV2")
         except CancelledError:
             pass
 
