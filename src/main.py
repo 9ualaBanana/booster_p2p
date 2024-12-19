@@ -176,7 +176,7 @@ async def accept_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             oc.session.commit()
 
             await oc.notification.edit_reply_markup(None)
-            oc.support_message = await context.bot.send_message(SUPPORT_ID, f"Ордер ID: `{md(oc.order.id, version=2)}`\nСтоимость: *{md(FormattingHelper.quantize(oc.order.total_price, 2), version=2)}* ₽\nКонтрагент: @{update.effective_user.username}", reply_markup=InlineKeyboardMarkup([
+            oc.support_message = await context.bot.send_message(SUPPORT_ID, f"Ордер ID: `{md(oc.order.id, version=2)}`\nСтоимость: *{md(FormattingHelper.quantize(oc.order.total_price, 2), version=2)}* ₽\nКонтрагент: @{update.effective_user.username}\nРеквизиты: `{oc.order.user.card}`", reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("Да ID", callback_data=f"{HandlerNames.YES_SUPPORT}|{oc.order.user_id}"), InlineKeyboardButton("Нет ID", callback_data=f"{HandlerNames.NO_SUPPORT}|{oc.order.user_id}")]
                 ]),
                 parse_mode="MarkdownV2")
