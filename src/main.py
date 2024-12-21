@@ -91,6 +91,7 @@ async def order(order_request: CreateOrderRequest):
     logging.debug(f"Found {len(users)} users eligible for accepting the order for buying {order_request.quantity} USDT.")
 
     for user in users:
+        user_id = user.id
         # Acquiring exclusive lock under which all `user_data` IO must be done.
         async with await OrderContextManager.get(user.id, application.user_data) as ocm:
             # Exceptional.
@@ -120,7 +121,6 @@ async def order(order_request: CreateOrderRequest):
                     oc.session.commit()
                     # Enables Order tracking for `OrderContext`
                     oc._order_id = order.id
-                    user_id = user.id
                     
                 except Exception as e:
                     logging.error(f"Error during order creation for user {user.name} ({user.id}): {e}", exc_info=True)
@@ -128,55 +128,55 @@ async def order(order_request: CreateOrderRequest):
                     continue
 
 
+        # Accept/Decline
         try:
             await wait_for(oc.handle_event.wait(), timeout=ACCEPT_ORDER_TIMEOUT)
-        
-            async with (await OrderContextManager.get(user_id, application.user_data)).context as oc:
-                match oc.order.status:
-                    case OrderStatus.ACCEPTED:
-                        oc.order.user.balance -= oc.order.quantity
-                        oc.order.user.frozen_balance += oc.order.quantity
-                        oc.session.commit()
-
-                        await oc.start_client_completion_waiter()
-
-                        return {
-                            "account": {
-                                "id": oc.order.user.id,
-                                "card": oc.order.user.card
-                            },
-                            "order": {
-                                "id": oc.order.id,
-                                "price": oc.order.price,
-                                "quantity": oc.order.quantity
-                            }
-                        }
-                    
-                    case OrderStatus.DECLINED:
-                        oc.session.delete(oc.order)
-                        oc.session.commit()
-
-                    case _:
-                        logging.error(f"Order ({oc.order.id}) was handled but didn't match any valid status.")
-        
         except TimeoutError:
-            async with (await OrderContextManager.get(user.id, application.user_data)).context as oc:
-                if oc.order.status == OrderStatus.PENDING:
+            pass
+        except Exception as e:
+            logging.error("Error during order handling: {e}", exc_info=True)
+
+
+        async with oc:
+            match oc.order.status:
+                case OrderStatus.ACCEPTED:
+                    oc.order.user.balance -= oc.order.quantity
+                    oc.order.user.frozen_balance += oc.order.quantity
+                    oc.session.commit()
+
+                    await oc.start_client_completion_waiter()
+
+                    return {
+                        "account": {
+                            "id": oc.order.user.id,
+                            "card": oc.order.user.card
+                        },
+                        "order": {
+                            "id": oc.order.id,
+                            "price": oc.order.price,
+                            "quantity": oc.order.quantity
+                        }
+                    }
+                
+                case OrderStatus.DECLINED:
+                    oc.session.delete(oc.order)
+                    oc.session.commit()
+
+                case OrderStatus.PENDING:
                     oc.order.user.balance -= ORDER_FEE
                     oc.session.delete(oc.order)
                     oc.session.commit()
 
                     await oc.notification.edit_text(f"Время ответа на ордер `{md(oc.order.id, version=2)}` истекло\nСервисная плата в размере *{md(FormattingHelper.quantize(ORDER_FEE, 8), version=2)}* USDT была изъята", reply_markup=None, parse_mode="MarkdownV2")
 
-                else:
-                    logging.warning(f"Handled order ({oc.order.id}) somehow reached timeout.")
-
-        except Exception as e:
-            logging.error("Order handling went wrong: {e}", exc_info=True)
-
+                case _:
+                    logging.error(f"Order ({oc.order.id}) didn't match any valid {OrderStatus.__name__}.")
         
-        async with await OrderContextManager.get(user.id, application.user_data) as ocm:
+
+        # Acquiring exclusive lock under which all `user_data` IO must be done.
+        async with await OrderContextManager.get(user_id, application.user_data) as ocm:
             ocm.remove_context()
+
 
     message = f"Order can't be completed. {("None of the users accepted it.") if len(users) > 0 else ('No users eligible for accepting the order were found.')}"
     logging.info(message)
@@ -300,9 +300,7 @@ async def complete_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Error completing order for user {user_id}: {e}", exc_info=True)
 
 async def call_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logging.debug(f"Support call requested for order {update.effective_message.text}")
     await update.callback_query.answer()
-
     try:
         async with (await OrderContextManager.get(update.effective_user.id, application.user_data)).context as oc:
             await update.effective_message.reply_markdown_v2(f"@techsupport\n\n*Ордер ID*: `{oc.order.id}`\n*Время оплаты*: `{oc.order.paid_at.astimezone(ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%d %H:%M:%S")}`")
