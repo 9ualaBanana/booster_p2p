@@ -101,4 +101,7 @@ class OrderContextManager:
         return self.user_data[self.id].setdefault(OrderContext.__name__, OrderContext(self.id, self))
     
     def remove_context(self):
-        self.user_data[self.id].pop(OrderContext.__name__)
+        if self.user_data[self.id].pop(OrderContext.__name__, None) is None:
+            logging.error(f"Error removing {OrderContext.__name__} for user {self.id}: context not found", exc_info=True)
+        logging.debug(f"Removed {OrderContext.__name__} for user {self.id}")
+            
