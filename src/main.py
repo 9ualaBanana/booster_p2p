@@ -445,7 +445,7 @@ async def stop_work(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def display_account(update: Update, user: User, session):
     users: List[User] = session.query(User).order_by(User.exchange_rate).all()
     await update.effective_message.reply_markdown_v2(
-        f"{user.name} | *{user.formatted_balance}* USDT | 1 USDT = *{user.formatted_exchange_rate}* ₽\nРеквизиты: `{user.card}`\n\n*TOP*:\n{'\n'.join([f"{user[0]}. {user[1].formatted_name} | *{user[1].formatted_balance}* USDT | 1 USDT = *{user[1].formatted_exchange_rate}* ₽" for user in enumerate(users[:TOP_LENGTH], 1)])}",
+        f"{user.name} \\| *{md(user.formatted_balance, version=2)}* USDT \\| 1 USDT \\= *{md(user.formatted_exchange_rate, version=2)}* ₽\nРеквизиты: `{user.card}`\n\n*TOP*:\n{'\n'.join([f"{user[0]}\\. {md(user[1].formatted_name, version=2)} \\| *{md(user[1].formatted_balance, version=2)}* USDT \\| 1 USDT \\= *{md(user[1].formatted_exchange_rate, version=2)}* ₽" for user in enumerate(users[:TOP_LENGTH], 1)])}",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Купить USDT", callback_data=order.__name__)],
             [
