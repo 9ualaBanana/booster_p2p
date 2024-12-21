@@ -12,7 +12,7 @@ class OrderContext:
         self.order = None
         self._user_id = user_id
         self._lock = Lock()
-        self.event = Event()
+        self.handle_event = Event()
         self.session = None
         self.notification: Message = None
         self.support_message: Message = None
@@ -62,8 +62,11 @@ class OrderContext:
                     order.user.frozen_balance -= order.quantity
                     self.session.delete(order)
                     self.session.commit()
+                    
                     self._ocm.remove_context()
                     await self.notification.edit_text(f"{self.notification.text_markdown_v2}\n\nКлиент не совершил перевод по ордеру вовремя\nОрдер отменён\nБаланс разморожен", parse_mode="MarkdownV2")
+                elif order.status == OrderStatus.COMPLETED:
+                    logging.error(f"Client completion waiter triggered for completed order ({order.id}) for user {self.order.user.id}")
         except CancelledError:
             pass
 
@@ -101,6 +104,7 @@ class OrderContextManager:
         return self.user_data[self.id].setdefault(OrderContext.__name__, OrderContext(self.id, self))
     
     def remove_context(self):
+        logging.debug(f"Removing {OrderContext.__name__} for user {self.id}")
         if self.user_data[self.id].pop(OrderContext.__name__, None) is None:
             logging.error(f"Error removing {OrderContext.__name__} for user {self.id}: context not found", exc_info=True)
         logging.debug(f"Removed {OrderContext.__name__} for user {self.id}")

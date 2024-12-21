@@ -4,7 +4,7 @@ import json
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ConversationHandler
 from telegram.helpers import escape_markdown as md
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Header, Depends, Response
 from uvicorn import Config, Server
 from config import SUPPORT_ID, TOKEN, API_KEY, ACCEPT_ORDER_TIMEOUT, TOP_LENGTH, ORDER_FEE
 from datetime import datetime, timezone
@@ -18,7 +18,8 @@ from creditcard import CreditCard
 from database import OrderStatus, SessionFactory, User, Order
 from pydantic import BaseModel, field_validator
 from formatting_helper import FormattingHelper
-from order_manager import OrderContext, OrderContextManager
+from order_manager import OrderContextManager
+
 
 class JsonFormatter(logging.Formatter):
     def format(self, record):
@@ -51,9 +52,9 @@ class HandlerNames(str, Enum):
     BUY_USDT = "buy_usdt"
     ACCEPT_ORDER = "accept_order"
     DECLINE_ORDER = "decline_order"
-    HANDLE_ORDER = "handle_order"
+    HANDLE_CLIENT_PAYMENT = "handle_order"
     COMPLETE_ORDER = "complete_order"
-    CONFIRM_ORDER = "confirm_order"
+    CONFIRM_CLIENT_PAYMENT = "confirm_order"
     CALL_SUPPORT = "call_support"
     YES_SUPPORT = "yes_support"
     NO_SUPPORT = "no_support"
@@ -78,55 +79,71 @@ class CreateOrderRequest(BaseModel):
 
 @app.post("/orders", dependencies=[Depends(validate_api_key)])
 async def order(order_request: CreateOrderRequest):
-    logging.info(f"Order requested with quantity: {order_request.quantity}")
+    logging.info(f"Received order request for {order_request.quantity} USDT.")
+
     with SessionFactory() as session:
         users = session.query(User).filter(
             User.is_working, 
             or_(~User.orders.any(), ~User.orders.any(Order.status != OrderStatus.COMPLETED)), 
             User.balance >= order_request.quantity
         ).order_by(User.exchange_rate).all()
+        
+    logging.debug(f"Found {len(users)} users eligible for accepting the order for buying {order_request.quantity} USDT.")
 
     for user in users:
-        try:
-            logging.info(f"Creating order for user {user.name} ({user.id})")
-            # Acquiring exclusive lock under which all `user_data` IO must be done.
-            async with await OrderContextManager.get(user.id, application.user_data) as ocm:
-                if ocm.context:
-                    raise EnvironmentError(f"User with all complete order has active {OrderContext.__name__}.")
+        # Acquiring exclusive lock under which all `user_data` IO must be done.
+        async with await OrderContextManager.get(user.id, application.user_data) as ocm:
+            # Exceptional.
+            if ocm.context:
+                if user.frozen_balance == 0:    # Safe to remove dangling OrderContext.
+                    logging.warning(f"User {user.name} ({user.id}) has no frozen balance but has an active order.")
+                    ocm.remove_context()
+                else:
+                    # Ensure support can handle that.
+                    async with ocm.context as oc:
+                        logging.error(f"User {user.name} ({user.id}) eligible for accepting the order already has an active order {oc.order.id} and frozen balance {user.frozen_balance}.")
+                        continue
                 
-                async with ocm.create_context() as oc:
+            logging.info(f"Creating order for user {user.name} ({user.id})")
+
+            async with ocm.create_context() as oc:
+                try:
                     order = Order(quantity=order_request.quantity, price=user.exchange_rate)
                     oc.session.add(user)
                     user.orders.append(order)
-                    oc.session.commit()
-                    oc._order_id = order.id
-
                     oc.notification = await application.bot.send_message(user.id,
                                                         f"Запрос на покупку *{md(FormattingHelper.quantize(order_request.quantity, 8), version=2)}* USDT\nБаланс: *{md(user.formatted_balance, version=2)}* USDT\nПрибыль: *{md(FormattingHelper.quantize(order_request.quantity * user.exchange_rate, 2), version=2)}* ₽",
                                                         reply_markup=InlineKeyboardMarkup([
                                                             [InlineKeyboardButton("Принять", callback_data=HandlerNames.ACCEPT_ORDER), InlineKeyboardButton("Отклонить", callback_data=HandlerNames.DECLINE_ORDER)]
                                                             ]),
                                                             parse_mode="MarkdownV2")
-        except Exception as e:
-            logging.error(f"Error during order creation for user {user.name} ({user.id}): {e}", exc_info=True)
-            continue
+                    oc.session.commit()
+                    # Enables Order tracking for `OrderContext`
+                    oc._order_id = order.id
+                    user_id = user.id
+                    
+                except Exception as e:
+                    logging.error(f"Error during order creation for user {user.name} ({user.id}): {e}", exc_info=True)
+                    ocm.remove_context()
+                    continue
 
 
         try:
-            await wait_for(oc.event.wait(), timeout=ACCEPT_ORDER_TIMEOUT)
+            await wait_for(oc.handle_event.wait(), timeout=ACCEPT_ORDER_TIMEOUT)
         
-            async with (await OrderContextManager.get(user.id, application.user_data)).context as oc:
+            async with (await OrderContextManager.get(user_id, application.user_data)).context as oc:
                 match oc.order.status:
                     case OrderStatus.ACCEPTED:
                         oc.order.user.balance -= oc.order.quantity
                         oc.order.user.frozen_balance += oc.order.quantity
                         oc.session.commit()
+
                         await oc.start_client_completion_waiter()
 
                         return {
                             "account": {
-                                "id": user.id,
-                                "card": user.card
+                                "id": oc.order.user.id,
+                                "card": oc.order.user.card
                             },
                             "order": {
                                 "id": oc.order.id,
@@ -137,11 +154,10 @@ async def order(order_request: CreateOrderRequest):
                     
                     case OrderStatus.DECLINED:
                         oc.session.delete(oc.order)
-                        oc._order_id = None
                         oc.session.commit()
 
                     case _:
-                        logging.error("Order was handled but didn't match any valid status.")
+                        logging.error(f"Order ({oc.order.id}) was handled but didn't match any valid status.")
         
         except TimeoutError:
             async with (await OrderContextManager.get(user.id, application.user_data)).context as oc:
@@ -162,44 +178,47 @@ async def order(order_request: CreateOrderRequest):
         async with await OrderContextManager.get(user.id, application.user_data) as ocm:
             ocm.remove_context()
 
-    # Define the reason why order can't be completed.
-    # It's either none of the users accepted it or there were no matching users who could complete the order.
-    logging.info("Order can't be completed. None of the users accepted it.")
-    raise HTTPException(status_code=404, detail="Order can't be completed. None of the users accepted it.")
+    message = f"Order can't be completed. {("None of the users accepted it.") if len(users) > 0 else ('No users eligible for accepting the order were found.')}"
+    logging.info(message)
+    raise HTTPException(status_code=404, detail=message)
 
 async def accept_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
+    try:
+        async with (await OrderContextManager.get(update.effective_user.id, application.user_data)).context as oc:
+            if oc.order.status == OrderStatus.PENDING:
+                oc.order.status = OrderStatus.ACCEPTED
+                oc.session.commit()
 
-    async with (await OrderContextManager.get(update.effective_user.id, application.user_data)).context as oc:
-        if oc.order.status == OrderStatus.PENDING:
-            oc.order.status = OrderStatus.ACCEPTED
-            oc.session.commit()
+                await oc.notification.edit_reply_markup(None)
+                oc.support_message = await context.bot.send_message(SUPPORT_ID, f"Ордер ID: `{md(oc.order.id, version=2)}`\nСтоимость: *{md(FormattingHelper.quantize(oc.order.total_price, 2), version=2)}* ₽\nКонтрагент: @{update.effective_user.username}\nРеквизиты: `{oc.order.user.card}`", reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Да ID", callback_data=f"{HandlerNames.YES_SUPPORT}|{oc.order.user_id}"), InlineKeyboardButton("Нет ID", callback_data=f"{HandlerNames.NO_SUPPORT}|{oc.order.user_id}")]
+                    ]),
+                    parse_mode="MarkdownV2")
+                
+                oc.handle_event.set()
 
-            await oc.notification.edit_reply_markup(None)
-            oc.support_message = await context.bot.send_message(SUPPORT_ID, f"Ордер ID: `{md(oc.order.id, version=2)}`\nСтоимость: *{md(FormattingHelper.quantize(oc.order.total_price, 2), version=2)}* ₽\nКонтрагент: @{update.effective_user.username}\nРеквизиты: `{oc.order.user.card}`", reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Да ID", callback_data=f"{HandlerNames.YES_SUPPORT}|{oc.order.user_id}"), InlineKeyboardButton("Нет ID", callback_data=f"{HandlerNames.NO_SUPPORT}|{oc.order.user_id}")]
-                ]),
-                parse_mode="MarkdownV2")
-            
-            oc.event.set()
-
-        else:
-            logging.warning(f"Order can't be accepted. It has {oc.order.status} status.")
+            else:
+                logging.warning(f"Order ({oc.order.id}) can't be accepted. It's not {OrderStatus.PENDING} ({oc.order.status}).")
+    except Exception as e:
+        logging.error(f"Error accepting order for user {update.effective_user.id}: {e}", exc_info=True)
 
 async def decline_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
+    try:
+        async with (await OrderContextManager.get(update.effective_user.id, application.user_data)).context as oc:
+            if oc.order.status == OrderStatus.PENDING:
+                oc.order.status = OrderStatus.DECLINED
+                oc.session.commit()
 
-    async with (await OrderContextManager.get(update.effective_user.id, application.user_data)).context as oc:
-        if oc.order.status == OrderStatus.PENDING:
-            oc.order.status = OrderStatus.DECLINED
-            oc.session.commit()
+                await oc.notification.delete()
 
-            await oc.notification.delete()
+                oc.handle_event.set()
 
-            oc.event.set()
-
-        else:
-            logging.warning(f"Order can't be declined. It has {oc.order.status} status.")
+            else:
+                logging.warning(f"Order ({oc.order.id}) can't be declined. It's not {OrderStatus.PENDING} ({oc.order.status}).")
+    except Exception as e:
+        logging.error(f"Error declining order ({oc.order.id}) for user {update.effective_user.id}: {e}", exc_info=True)
 
 
 class CompleteOrderRequest(BaseModel):
@@ -210,95 +229,171 @@ class CompleteOrderRequest(BaseModel):
 async def order(request: CompleteOrderRequest):
     logging.info(f"{CompleteOrderRequest.__name__} for order {request.order_id} for account {request.account_id} from client was received.")
 
-    async with (await OrderContextManager.get(request.account_id, application.user_data)).context as oc:
-        await oc.cancel_client_completion_waiter()
-        if oc.order.id == request.order_id:
-            if oc.order.status == OrderStatus.ACCEPTED:
-                oc.order.paid_at = datetime.now(timezone.utc)
-                oc.session.commit()
+    try:
+        async with (await OrderContextManager.get(request.account_id, application.user_data)).context as oc:
+            # Client sent wrong data. Active order doesn't match the user.
+            if oc.order.id == request.order_id:
+                if oc.order.status == OrderStatus.ACCEPTED:
+                    await oc.cancel_client_completion_waiter()
 
-                await application.bot.send_message(oc.order.user.id, f"Клиент оплатил *{md(FormattingHelper.quantize(oc.order.total_price, 2), version=2)}* ₽", reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Подтвердить", callback_data=HandlerNames.CONFIRM_ORDER), InlineKeyboardButton("Обратиться в тех. поддержку", callback_data=HandlerNames.CALL_SUPPORT)]
-                    ]),
-                    parse_mode="MarkdownV2")
+                    oc.order.paid_at = datetime.now(timezone.utc)
+                    oc.session.commit()
+
+                    await application.bot.send_message(oc.order.user.id, f"Клиент оплатил *{md(FormattingHelper.quantize(oc.order.total_price, 2), version=2)}* ₽", reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("Подтвердить", callback_data=HandlerNames.CONFIRM_CLIENT_PAYMENT), InlineKeyboardButton("Обратиться в тех. поддержку", callback_data=HandlerNames.CALL_SUPPORT)]
+                        ]),
+                        parse_mode="MarkdownV2")
+                    
+                    return Response(status_code=202)
+                else:
+                    # How did client know the order ID before it's been accepted?
+                    message = f"Order {oc.order.id} hasn't been accepted yet, thus can't be completed."
+                    logging.error(message)
+                    raise HTTPException(status_code=409, detail=message)
             else:
-                message = f"Active order {oc.order.id} can't be completed. It has {oc.order.status} status."
-                logging.error(message)
+                message = f"Order {oc.order.id} can't be completed. Received wrong order ID for account {request.account_id}: {request.order_id}"
+                logging.warning(message)
                 raise HTTPException(status_code=409, detail=message)
-        else:
-            message = f"Active order {oc.order.id} can't be completed. Received wrong order ID for account {request.account_id}: {request.order_id}"
-            logging.error(message)
-            raise HTTPException(status_code=404, detail=message)
+    except Exception as e:
+        logging.error(f"Error completing order for account {request.account_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Error completing order.")
     
-async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def confirm_client_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     
     await update.effective_message.edit_text(f"{update.effective_message.text_markdown_v2}\n\nВы уверены?", reply_markup=InlineKeyboardMarkup([
-        [InlineKeyboardButton("Да", callback_data=HandlerNames.COMPLETE_ORDER), InlineKeyboardButton("Нет", callback_data=HandlerNames.HANDLE_ORDER)]
+        [InlineKeyboardButton("Да", callback_data=HandlerNames.COMPLETE_ORDER), InlineKeyboardButton("Нет", callback_data=HandlerNames.HANDLE_CLIENT_PAYMENT)]
         ]),
         parse_mode="MarkdownV2")
     
-async def handle_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logging.info(f"Order handling requested for order {update.effective_message.text}")
+async def handle_client_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
 
     async with (await OrderContextManager.get(update.effective_user.id, application.user_data)).context as oc:
         await update.effective_message.edit_text(f"Клиент оплатил *{md(FormattingHelper.quantize(oc.order.total_price, 2), version=2)}* ₽", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("Подтвердить", callback_data=HandlerNames.CONFIRM_ORDER), InlineKeyboardButton("Обратиться в тех. поддержку", callback_data=HandlerNames.CALL_SUPPORT)]
+            [InlineKeyboardButton("Подтвердить", callback_data=HandlerNames.CONFIRM_CLIENT_PAYMENT), InlineKeyboardButton("Обратиться в тех. поддержку", callback_data=HandlerNames.CALL_SUPPORT)]
             ]),
             parse_mode="MarkdownV2")
         
 async def complete_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
 
-    async with (await OrderContextManager.get(update.effective_user.id, application.user_data)).context as oc:
-        if oc.order.status == OrderStatus.ACCEPTED:
-            oc.order.user.frozen_balance -= oc.order.quantity
-            oc.order.status = OrderStatus.COMPLETED
-            oc.session.commit()
-            await update.effective_message.delete()
-            async with await OrderContextManager.get(update.effective_user.id, application.user_data) as ocm:
-                ocm.remove_context()
-            logging.info(f"Order {oc.order.id} completed for user {update.effective_user.id}")
-            # Send confirmation back to the client.
+    user_id = update.effective_user.id
+    try:
+        async with (await OrderContextManager.get(user_id, application.user_data)).context as oc:
+            if oc.order.status == OrderStatus.ACCEPTED:
+                oc.order.user.frozen_balance -= oc.order.quantity
+                oc.order.status = OrderStatus.COMPLETED
+                oc.session.commit()
+
+                await update.effective_message.delete()
+                async with await OrderContextManager.get(user_id, application.user_data) as ocm:
+                    ocm.remove_context()
+
+                logging.info(f"Order {oc.order.id} completed for user {user_id}")
+                # Send confirmation back to the client.
+            else:
+                # Must be impossible due to preceding validations.
+                message = f"{OrderStatus.PENDING} order {oc.order.id} got through to {complete_order.__name__}."
+                logging.error(message)
+    except Exception as e:
+        logging.error(f"Error completing order for user {user_id}: {e}", exc_info=True)
 
 async def call_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logging.info(f"Support call requested for order {update.effective_message.text}")
+    logging.debug(f"Support call requested for order {update.effective_message.text}")
     await update.callback_query.answer()
 
-    async with (await OrderContextManager.get(update.effective_user.id, application.user_data)).context as oc:
-        await update.effective_message.reply_markdown_v2(f"@techsupport\n\n*Ордер ID*: `{oc.order.id}`\n*Время оплаты*: `{oc.order.paid_at.astimezone(ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%d %H:%M:%S")}`")
+    try:
+        async with (await OrderContextManager.get(update.effective_user.id, application.user_data)).context as oc:
+            await update.effective_message.reply_markdown_v2(f"@techsupport\n\n*Ордер ID*: `{oc.order.id}`\n*Время оплаты*: `{oc.order.paid_at.astimezone(ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%d %H:%M:%S")}`")
+    except Exception as e:
+        logging.error(f"Error calling support for user {update.effective_user.id}: {e}", exc_info=True)
 
 async def yes_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logging.info(f"Yes support called with {update.callback_query.data}")
+    logging.debug(f"Yes support called with {update.callback_query.data}")
+
     await update.callback_query.answer()
 
-    async with (await OrderContextManager.get(int(update.callback_query.data.split('|')[-1]), application.user_data)).context as oc:
-        if oc.order.status == OrderStatus.ACCEPTED:
-            logging.info(f"Order {oc.order.id} completed by support for user {update.effective_user.id}")
-            oc.order.user.frozen_balance -= oc.order.quantity
-            oc.order.status = OrderStatus.COMPLETED
-            oc.session.commit()
-            await update.effective_message.delete()
-            async with await OrderContextManager.get(update.effective_user.id, application.user_data) as ocm:
-                ocm.remove_context()
-            # Send confirmation back to the client.
+    user_id = int(update.callback_query.data.split('|')[-1])
+    if oc := (await OrderContextManager.get(user_id, application.user_data)).context:
+        try:
+            async with oc:
+                if oc.order.status == OrderStatus.ACCEPTED:
+                    oc.order.user.frozen_balance -= oc.order.quantity
+                    oc.order.status = OrderStatus.COMPLETED
+                    oc.session.commit()
+
+                    await update.effective_message.delete()
+
+                    await oc.cancel_client_completion_waiter()
+
+                    async with await OrderContextManager.get(user_id, application.user_data) as ocm:
+                        ocm.remove_context()
+                    # Send confirmation back to the client.
+                    logging.info(f"Order {oc.order.id} completed by support for user {user_id}")
+
+        except Exception as e:
+            logging.error(f"Error resolving order by support for user {user_id}: {e}", exc_info=True)
+    else:
+        with SessionFactory() as session:
+            orders = session.query(Order).filter_by(user_id=user_id, status=OrderStatus.ACCEPTED).all()
+
+            if len(orders) == 0:
+                logging.warning(f"No active orders for user {user_id}.")
+                return
+            elif len(orders) > 1:
+                logging.error(f"Expected exactly one active order for user {user_id}, found {len(orders)}.")
+                # Wtf?
+                return
+            
+            order = orders[0]
+            order.user.frozen_balance -= order.quantity
+            order.status = OrderStatus.COMPLETED
+            session.commit()
 
 async def no_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info(f"No support called with {update.callback_query.data}")
+
     await update.callback_query.answer()
 
-    async with (await OrderContextManager.get(int(update.callback_query.data.split('|')[-1]), application.user_data)).context as oc:
-        if oc.order.status == OrderStatus.ACCEPTED:
-            logging.info(f"Order {oc.order.id} rejected by support for user {update.effective_user.id}")
-            oc.order.user.frozen_balance -= oc.order.quantity
-            oc.order.user.balance += oc.order.quantity
-            oc.session.delete(oc.order)
-            oc.session.commit()
-            await update.effective_message.delete()
-            async with await OrderContextManager.get(update.effective_user.id, application.user_data) as ocm:
-                ocm.remove_context()
-            # Send rejection back to the client.
+    user_id = int(update.callback_query.data.split('|')[-1])
+    if oc := (await OrderContextManager.get(user_id, application.user_data)).context:
+        try:
+            async with oc:
+                if oc.order.status == OrderStatus.ACCEPTED:
+                    oc.order.user.frozen_balance -= oc.order.quantity
+                    oc.order.user.balance += oc.order.quantity
+                    oc.session.delete(oc.order)
+                    oc.session.commit()
+
+                    await update.effective_message.delete()
+
+                    await oc.cancel_client_completion_waiter()
+
+                    async with await OrderContextManager.get(user_id, application.user_data) as ocm:
+                        ocm.remove_context()
+                    # Send rejection back to the client.
+                    logging.info(f"Order {oc.order.id} rejected by support for user {user_id}")
+
+        except Exception as e:
+            logging.error(f"Error resolving order by support for user {user_id}: {e}", exc_info=True)
+    else:
+        with SessionFactory() as session:
+            orders = session.query(Order).filter_by(user_id=user_id, status=OrderStatus.ACCEPTED).all()
+
+            if len(orders) == 0:
+                logging.warning(f"No active orders for user {user_id}.")
+                return
+            elif len(orders) > 1:
+                logging.error(f"Expected exactly one active order for user {user_id}, found {len(orders)}.")
+                # Wtf?
+                return
+            
+            order = orders[0]
+            order.user.frozen_balance -= oc.order.quantity
+            order.user.balance += oc.order.quantity
+            session.delete(oc.order)
+            session.commit()
     
 async def order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info(f"User {update.effective_user.id} requested to start order")
@@ -505,7 +600,7 @@ async def main():
     application.add_handlers([conv_handler_registration, conv_handler_deposit_usdt, conv_handler_exchange_rate, conv_handler_card_details])
     application.add_handlers([CallbackQueryHandler(accept_order, pattern=HandlerNames.ACCEPT_ORDER), CallbackQueryHandler(decline_order, pattern=HandlerNames.DECLINE_ORDER)])
     application.add_handlers([CallbackQueryHandler(start_work, pattern=HandlerNames.START_WORK), CallbackQueryHandler(stop_work, pattern=HandlerNames.STOP_WORK)])
-    application.add_handlers([CallbackQueryHandler(handle_order, pattern=HandlerNames.HANDLE_ORDER), CallbackQueryHandler(confirm_order, pattern=HandlerNames.CONFIRM_ORDER), CallbackQueryHandler(complete_order, pattern=HandlerNames.COMPLETE_ORDER), CallbackQueryHandler(call_support, pattern=HandlerNames.CALL_SUPPORT)])
+    application.add_handlers([CallbackQueryHandler(handle_client_payment, pattern=HandlerNames.HANDLE_CLIENT_PAYMENT), CallbackQueryHandler(confirm_client_payment, pattern=HandlerNames.CONFIRM_CLIENT_PAYMENT), CallbackQueryHandler(complete_order, pattern=HandlerNames.COMPLETE_ORDER), CallbackQueryHandler(call_support, pattern=HandlerNames.CALL_SUPPORT)])
     application.add_handlers([CallbackQueryHandler(yes_support, pattern=f"{HandlerNames.YES_SUPPORT}|(d+)"), CallbackQueryHandler(no_support, pattern=f"{HandlerNames.NO_SUPPORT}|(d+)")])
 
     # Both servers .start() and not .run() so to not block the event loop on which they both must run.
