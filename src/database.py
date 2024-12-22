@@ -17,6 +17,11 @@ class OrderStatus(str, Enum):
     DECLINED = "declined"
     COMPLETED = "completed"
 
+class Currency(str, Enum):
+    USD = "USD"
+    EUR = "EUR"
+    RUB = "RUB"
+
 class User(Base):
     __tablename__ = 'users'
     
@@ -26,6 +31,7 @@ class User(Base):
     balance: Mapped[Decimal] = Column(Numeric(precision=20, scale=8), nullable=False, default=Decimal(0))
     frozen_balance: Mapped[Decimal] = Column(Numeric(precision=20, scale=8), nullable=False, default=Decimal(0))
     exchange_rate: Mapped[Decimal] = Column(Numeric(precision=20, scale=8), nullable=False)
+    currency: Mapped[Currency] = Column(String, nullable=False)
     is_working: Mapped[bool] = Column(Boolean, nullable=False, default=False)
     
     orders: Mapped[List["Order"]] = relationship("Order", back_populates="user")
@@ -41,16 +47,12 @@ class User(Base):
     
     @property
     def formatted_exchange_rate(self) -> str:
-        return FormattingHelper.quantize(self.exchange_rate, 2)
+        return str(0) if self.exchange_rate.is_zero() else FormattingHelper.quantize(self.exchange_rate, 2)
     
     @property
     def formatted_balance(self) -> str:
-        return FormattingHelper.quantize(self.balance, 8)
+        return str(0) if self.balance.is_zero() else FormattingHelper.quantize(self.balance, 8)
     
-    @property
-    def formatted_frozen_balance(self) -> str:
-        return FormattingHelper.quantize(self.frozen_balance, 8)
-
 class Order(Base):
     __tablename__ = 'orders'
     

@@ -15,7 +15,7 @@ from sqlalchemy import or_
 from decimal import Decimal, ROUND_HALF_EVEN
 from typing import List
 from creditcard import CreditCard
-from database import OrderStatus, SessionFactory, User, Order
+from database import Currency, OrderStatus, SessionFactory, User, Order
 from pydantic import BaseModel, field_validator
 from formatting_helper import FormattingHelper
 from order_manager import OrderContextManager
@@ -44,7 +44,7 @@ formatter = JsonFormatter()
 for handler in logging.root.handlers:
    handler.setFormatter(formatter)
 
-CHANGE_EXCHANGE_RATE, CHANGE_CARD_DETAILS, ORDER = range(3)
+CHANGE_EXCHANGE_RATE, CHANGE_CARD_DETAILS, CHANGE_CURRENCY, ORDER = range(4)
 
 class HandlerNames(str, Enum):
     CHANGE_EXCHANGE_RATE = "change_exchange_rate"
@@ -70,6 +70,7 @@ async def validate_api_key(x_api_key: str = Header(...)):
 
 class CreateOrderRequest(BaseModel):
     quantity: Decimal
+    currency: str
 
     @field_validator('quantity')
     def validate_amount(cls, quantity):
@@ -77,18 +78,25 @@ class CreateOrderRequest(BaseModel):
             raise ValueError("Amount must be positive.")
         return quantity.quantize(Decimal('0.01'), rounding=ROUND_HALF_EVEN)
 
+    @field_validator('currency')
+    def validate_currency(cls, currency):
+        if currency not in Currency.__members__:
+            raise ValueError(f"Invalid currency: {currency}. Must be one of {list(Currency.__members__.keys())}.")
+        return currency
+
 @app.post("/orders", dependencies=[Depends(validate_api_key)])
 async def order(order_request: CreateOrderRequest):
-    logging.info(f"Received order request for {order_request.quantity} USDT.")
+    logging.info(f"Received order request for {order_request.quantity} USDT for {order_request.currency}.")
 
     with SessionFactory() as session:
         users = session.query(User).filter(
             User.is_working, 
-            or_(~User.orders.any(), ~User.orders.any(Order.status != OrderStatus.COMPLETED)), 
+            or_(~User.orders.any(), ~User.orders.any(Order.status != OrderStatus.COMPLETED)),
+            User.currency == order_request.currency,
             User.balance >= order_request.quantity
         ).order_by(User.exchange_rate).all()
         
-    logging.debug(f"Found {len(users)} users eligible for accepting the order for buying {order_request.quantity} USDT.")
+    logging.debug(f"Found {len(users)} users eligible for accepting the order for buying {order_request.quantity} USDT for {order_request.currency}.")
 
     for user in users:
         user_id = user.id
@@ -113,7 +121,7 @@ async def order(order_request: CreateOrderRequest):
                     oc.session.add(user)
                     user.orders.append(order)
                     oc.notification = await application.bot.send_message(user.id,
-                                                        f"Запрос на покупку *{md(FormattingHelper.quantize(order_request.quantity, 8), version=2)}* USDT\nБаланс: *{md(user.formatted_balance, version=2)}* USDT\nПрибыль: *{md(FormattingHelper.quantize(order_request.quantity * user.exchange_rate, 2), version=2)}* ₽",
+                                                        f"Запрос на покупку *{md(FormattingHelper.quantize(order_request.quantity, 8), version=2)}* USDT\nБаланс: *{md(user.formatted_balance, version=2)}* USDT\nПрибыль: *{md(FormattingHelper.quantize(order_request.quantity * user.exchange_rate, 2), version=2)}* {user.currency}",
                                                         reply_markup=InlineKeyboardMarkup([
                                                             [InlineKeyboardButton("Принять", callback_data=HandlerNames.ACCEPT_ORDER), InlineKeyboardButton("Отклонить", callback_data=HandlerNames.DECLINE_ORDER)]
                                                             ]),
@@ -190,8 +198,9 @@ async def accept_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 oc.order.status = OrderStatus.ACCEPTED
                 oc.session.commit()
 
+                # Make ACID.
                 await oc.notification.edit_reply_markup(None)
-                oc.support_message = await context.bot.send_message(SUPPORT_ID, f"Ордер ID: `{md(oc.order.id, version=2)}`\nСтоимость: *{md(FormattingHelper.quantize(oc.order.total_price, 2), version=2)}* ₽\nКонтрагент: @{update.effective_user.username}\nРеквизиты: `{oc.order.user.card}`", reply_markup=InlineKeyboardMarkup([
+                oc.support_message = await context.bot.send_message(SUPPORT_ID, f"Ордер ID: `{md(oc.order.id, version=2)}`\nСтоимость: *{md(FormattingHelper.quantize(oc.order.total_price, 2), version=2)}* {oc.order.user.currency}\nКонтрагент: @{update.effective_user.username}\nРеквизиты: `{oc.order.user.card}`", reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("Да ID", callback_data=f"{HandlerNames.YES_SUPPORT}|{oc.order.user_id}"), InlineKeyboardButton("Нет ID", callback_data=f"{HandlerNames.NO_SUPPORT}|{oc.order.user_id}")]
                     ]),
                     parse_mode="MarkdownV2")
@@ -211,6 +220,7 @@ async def decline_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 oc.order.status = OrderStatus.DECLINED
                 oc.session.commit()
 
+                # Make ACID.
                 await oc.notification.delete()
 
                 oc.handle_event.set()
@@ -239,7 +249,7 @@ async def order(request: CompleteOrderRequest):
                     oc.order.paid_at = datetime.now(timezone.utc)
                     oc.session.commit()
 
-                    await application.bot.send_message(oc.order.user.id, f"Клиент оплатил *{md(FormattingHelper.quantize(oc.order.total_price, 2), version=2)}* ₽", reply_markup=InlineKeyboardMarkup([
+                    await application.bot.send_message(oc.order.user.id, f"Клиент оплатил *{md(FormattingHelper.quantize(oc.order.total_price, 2), version=2)}* {oc.order.user.currency}", reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("Подтвердить", callback_data=HandlerNames.CONFIRM_CLIENT_PAYMENT), InlineKeyboardButton("Обратиться в тех. поддержку", callback_data=HandlerNames.CALL_SUPPORT)]
                         ]),
                         parse_mode="MarkdownV2")
@@ -270,7 +280,7 @@ async def handle_client_payment(update: Update, context: ContextTypes.DEFAULT_TY
     await update.callback_query.answer()
 
     async with (await OrderContextManager.get(update.effective_user.id, application.user_data)).context as oc:
-        await update.effective_message.edit_text(f"Клиент оплатил *{md(FormattingHelper.quantize(oc.order.total_price, 2), version=2)}* ₽", reply_markup=InlineKeyboardMarkup([
+        await update.effective_message.edit_text(f"Клиент оплатил *{md(FormattingHelper.quantize(oc.order.total_price, 2), version=2)}* {oc.order.user.currency}", reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Подтвердить", callback_data=HandlerNames.CONFIRM_CLIENT_PAYMENT), InlineKeyboardButton("Обратиться в тех. поддержку", callback_data=HandlerNames.CALL_SUPPORT)]
             ]),
             parse_mode="MarkdownV2")
@@ -488,12 +498,36 @@ async def receive_exchange_rate(update: Update, context: ContextTypes.DEFAULT_TY
         if user is None:
             user = context.user_data.get('new_user', None)
             if user is not None:
+                user.exchange_rate = new_exchange_rate
+                logging.info(f"User {user.id} exchange rate changed to {new_exchange_rate}")
+                await update.message.reply_text(f"Курс обновлен: {user.formatted_exchange_rate}.")
+                await update.effective_message.reply_text("Предоставьте новую валюту:")
+                return CHANGE_CURRENCY
+        else:
+            user.exchange_rate = new_exchange_rate
+            session.commit()
+            logging.info(f"User {user.id} exchange rate changed to {new_exchange_rate}")
+            await update.message.reply_text(f"Курс обновлен: {user.formatted_exchange_rate}.")
+            await update.effective_message.reply_text("Предоставьте новую валюту:")
+            return CHANGE_CURRENCY
+
+async def receive_currency(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    currency = update.message.text.strip().upper()
+    if currency not in Currency.__members__:
+        await update.message.reply_text(f"Некорректная валюта. Доступные валюты: {', '.join(Currency.__members__.keys())}.")
+        return
+
+    with SessionFactory() as session:
+        user: User | None = session.query(User).filter_by(id=update.effective_user.id).one_or_none()
+        if user is None:
+            user = context.user_data.get('new_user', None)
+            if user is not None:
                 session.add(user)
-        user.exchange_rate = new_exchange_rate
+        user.currency = currency
         session.commit()
             
-        logging.info(f"User {user.id} exchange rate changed to {new_exchange_rate}")
-        await update.message.reply_text(f"Курс обновлен: {user.formatted_exchange_rate} ₽.")
+        logging.info(f"User {user.id} currency changed to {currency}")
+        await update.message.reply_text(f"Валюта обновлена: {currency}.")
         await display_account(update, user, session)
 
     return ConversationHandler.END
@@ -538,7 +572,7 @@ async def stop_work(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def display_account(update: Update, user: User, session):
     users: List[User] = session.query(User).order_by(User.exchange_rate).all()
     await update.effective_message.reply_markdown_v2(
-        f"{user.name} \\| *{md(user.formatted_balance, version=2)}* USDT \\| 1 USDT \\= *{md(user.formatted_exchange_rate, version=2)}* ₽\nРеквизиты: `{user.card}`\n\n*TOP*:\n{'\n'.join([f"{user[0]}\\. {md(user[1].formatted_name, version=2)} \\| *{md(user[1].formatted_balance, version=2)}* USDT \\| 1 USDT \\= *{md(user[1].formatted_exchange_rate, version=2)}* ₽" for user in enumerate(users[:TOP_LENGTH], 1)])}",
+        f"{user.name} \\| *{md(user.formatted_balance, version=2)}* USDT \\| 1 USDT \\= *{md(user.formatted_exchange_rate, version=2)}* {user.currency}\nРеквизиты: `{user.card}`\n\n*TOP*:\n{'\n'.join([f"{user[0]}\\. {md(user[1].formatted_name, version=2)} \\| *{md(user[1].formatted_balance, version=2)}* USDT \\| 1 USDT \\= *{md(user[1].formatted_exchange_rate, version=2)}* {user[1].currency}" for user in enumerate(users[:TOP_LENGTH], 1)])}",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Купить USDT", callback_data=order.__name__)],
             [
@@ -562,7 +596,8 @@ async def main():
         entry_points=[CommandHandler("start", start)],
         states={
             CHANGE_EXCHANGE_RATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_exchange_rate)],
-            CHANGE_CARD_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_card_details)],
+            CHANGE_CURRENCY: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_currency)],
+            CHANGE_CARD_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_card_details)]
         },
         fallbacks=[cancel_handler],
         persistent=False,
@@ -572,6 +607,7 @@ async def main():
         entry_points=[CallbackQueryHandler(change_exchange_rate, pattern=HandlerNames.CHANGE_EXCHANGE_RATE)],
         states={
             CHANGE_EXCHANGE_RATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_exchange_rate)],
+            CHANGE_CURRENCY: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_currency)]
         },
         fallbacks=[cancel_handler],
         persistent=False,
