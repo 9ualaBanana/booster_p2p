@@ -428,9 +428,7 @@ async def receive_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Move to actual handler that will validate deposit transaction.
     with SessionFactory() as session:
-        user = session.query(User).filter_by(id=update.effective_user.id).one_or_none()
-        
-        if user:
+        if user := session.query(User).filter_by(id=update.effective_user.id).one_or_none():
             user.balance += amount
             session.commit()
             logging.info(f"User {user.id} balance updated with {amount}")
@@ -449,30 +447,29 @@ async def change_card_details(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     return CHANGE_CARD_DETAILS
 
-async def receive_card_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def change_card_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
     card_number = ''.join(update.message.text.strip().split())
     if card_number.isdigit():
         card = CreditCard(card_number)
         if card.is_valid and not card.is_expired:
             with SessionFactory() as session:
-                user: User | None = session.query(User).filter_by(id=update.effective_user.id).one_or_none()
-                if user is None:
-                    user = context.user_data.get('new_user', None)
-                    if user is not None:
-                        user.card = card.number
-                        logging.info(f"User card details changed to {card.number}")
-                        await update.message.reply_text(f"Реквизиты успешно изменены {card.number}.")
-                        await update.effective_message.reply_text("Предоставьте новый курс:")
-                        return CHANGE_EXCHANGE_RATE
-                else:
+                if user := session.query(User).filter_by(id=update.effective_user.id).one_or_none():
                     user.card = card.number
                     session.commit()
                     logging.info(f"User card details changed to {card.number}")
                     await update.message.reply_text(f"Реквизиты успешно изменены {card.number}.")
                     await display_account(update, user, session)
-
                     return ConversationHandler.END
-    
+                elif user := context.user_data.get('new_user', None):
+                    user.card = card.number
+                    logging.info(f"User card details changed to {card.number}")
+                    await update.message.reply_text(f"Реквизиты успешно изменены {card.number}.")
+                    await update.effective_message.reply_text("Предоставьте новый курс:")
+                    return CHANGE_EXCHANGE_RATE
+                else:
+                    await update.message.reply_text("Аккаунт не найден.")
+                    return ConversationHandler.END
+            
     await update.message.reply_text("Предоставленные реквезиты некорректны.")
 
 async def change_exchange_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -494,60 +491,64 @@ async def receive_exchange_rate(update: Update, context: ContextTypes.DEFAULT_TY
         return
     
     with SessionFactory() as session:
-        user: User | None = session.query(User).filter_by(id=update.effective_user.id).one_or_none()
-        if user is None:
-            user = context.user_data.get('new_user', None)
-            if user is not None:
-                user.exchange_rate = new_exchange_rate
-                logging.info(f"User {user.id} exchange rate changed to {new_exchange_rate}")
-                await update.message.reply_text(f"Курс обновлен: {user.formatted_exchange_rate}.")
-                await update.effective_message.reply_text("Предоставьте новую валюту:")
-                return CHANGE_CURRENCY
-        else:
+        if user := session.query(User).filter_by(id=update.effective_user.id).one_or_none():
             user.exchange_rate = new_exchange_rate
             session.commit()
-            logging.info(f"User {user.id} exchange rate changed to {new_exchange_rate}")
-            await update.message.reply_text(f"Курс обновлен: {user.formatted_exchange_rate}.")
-            await update.effective_message.reply_text("Предоставьте новую валюту:")
-            return CHANGE_CURRENCY
+        elif user := context.user_data.get('new_user', None):
+            user.exchange_rate = new_exchange_rate
+        else:
+            await update.message.reply_text("Аккаунт не найден.")
+            return ConversationHandler.END
+
+        logging.info(f"User {user.id} exchange rate changed to {new_exchange_rate}")
+        await update.message.reply_text(f"Курс обновлен: {user.formatted_exchange_rate}.")
+
+        await update.effective_message.reply_text(
+            "Предоставьте новую валюту:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(currency.name, callback_data=currency.name) for currency in Currency],
+                [InlineKeyboardButton("Назад", callback_data=HandlerNames.CHANGE_EXCHANGE_RATE)]
+            ])
+        )
+        return CHANGE_CURRENCY
 
 async def receive_currency(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    currency = update.message.text.strip().upper()
+    currency = update.callback_query.data.strip().upper()
     if currency not in Currency.__members__:
-        await update.message.reply_text(f"Некорректная валюта. Доступные валюты: {', '.join(Currency.__members__.keys())}.")
+        await update.callback_query.answer(f"Некорректная валюта. Доступные валюты: {', '.join(Currency.__members__.keys())}.")
         return
 
     with SessionFactory() as session:
-        user: User | None = session.query(User).filter_by(id=update.effective_user.id).one_or_none()
-        if user is None:
-            user = context.user_data.get('new_user', None)
-            if user is not None:
-                session.add(user)
-        user.currency = currency
-        session.commit()
-            
-        logging.info(f"User {user.id} currency changed to {currency}")
-        await update.message.reply_text(f"Валюта обновлена: {currency}.")
-        await display_account(update, user, session)
+        if user := session.query(User).filter_by(id=update.effective_user.id).one_or_none():
+            user.currency = currency
+        elif user := context.user_data.get('new_user', None):
+            user.currency = currency
+            session.add(user)
+        else:
+            await update.callback_query.answer("Аккаунт не найден.")
+            return ConversationHandler.END
 
-    return ConversationHandler.END
+        session.commit()
+
+        logging.info(f"User {user.id} currency changed to {currency}")
+        await update.callback_query.answer(f"Валюта обновлена: {currency}")
+
+        await display_account(update, user, session)
+        return ConversationHandler.END
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logging.info(f"User {update.effective_user.id} started bot")
     with SessionFactory() as session:
-        user = session.query(User).filter_by(id=update.effective_user.id).one_or_none()
-
-        if user is None:
-            if update.effective_user.username is None:
+        if user := session.query(User).filter_by(id=update.effective_user.id).one_or_none():
+            await display_account(update, user, session)
+            return ConversationHandler.END
+        else:
+            if update.effective_user.username:
+                context.user_data['new_user'] = User(id=update.effective_user.id, name=update.effective_user.name)
+                await update.effective_message.reply_text("Предоставьте новые реквизиты:")
+                return CHANGE_CARD_DETAILS
+            else:
                 await update.effective_message.reply_text("Имя пользователя не установлено. Выберите имя пользователя в настройках.\n(Настройки -> Выбрать имя пользователя)")
                 return ConversationHandler.END
-            context.user_data['new_user'] = User(id=update.effective_user.id, name=update.effective_user.name)
-            await update.effective_message.reply_text("Предоставьте новые реквезиты:")
-            return CHANGE_CARD_DETAILS
-        
-        await display_account(update, user, session)
-
-        return ConversationHandler.END
     
 async def start_work(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info(f"User {update.effective_user.id} started work")
@@ -584,30 +585,36 @@ async def display_account(update: Update, user: User, session):
         ]))
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['active_conversation'] = None
     await update.message.reply_text("Операция отменена.")
     return ConversationHandler.END
     
 
 async def main():
+    change_exchange_rate_handler = CallbackQueryHandler(change_exchange_rate, pattern=HandlerNames.CHANGE_EXCHANGE_RATE)
     cancel_handler = CommandHandler("cancel", cancel)
 
     conv_handler_registration = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
+            CHANGE_CARD_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, change_card_details)],
             CHANGE_EXCHANGE_RATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_exchange_rate)],
-            CHANGE_CURRENCY: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_currency)],
-            CHANGE_CARD_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_card_details)]
+            CHANGE_CURRENCY: [
+                CallbackQueryHandler(receive_currency, pattern=f"({'|'.join(Currency.__members__.keys())})"),
+                change_exchange_rate_handler
+                ]
         },
         fallbacks=[cancel_handler],
         persistent=False,
     )
 
     conv_handler_exchange_rate = ConversationHandler(
-        entry_points=[CallbackQueryHandler(change_exchange_rate, pattern=HandlerNames.CHANGE_EXCHANGE_RATE)],
+        entry_points=[change_exchange_rate_handler],
         states={
             CHANGE_EXCHANGE_RATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_exchange_rate)],
-            CHANGE_CURRENCY: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_currency)]
+            CHANGE_CURRENCY: [
+                CallbackQueryHandler(receive_currency, pattern=f"({'|'.join(Currency.__members__.keys())})"),
+                change_exchange_rate_handler
+                ]
         },
         fallbacks=[cancel_handler],
         persistent=False,
@@ -616,7 +623,7 @@ async def main():
     conv_handler_card_details = ConversationHandler(
         entry_points=[CallbackQueryHandler(change_card_details, pattern=HandlerNames.CHANGE_CARD_DETAILS)],
         states={
-            CHANGE_CARD_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_card_details)],
+            CHANGE_CARD_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, change_card_details)],
         },
         fallbacks=[cancel_handler],
         persistent=False,
