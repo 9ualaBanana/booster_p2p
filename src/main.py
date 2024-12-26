@@ -407,8 +407,8 @@ async def order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logging.info(f"User {update.effective_user.id} requested to start order")
     await update.callback_query.answer()
 
-    await update.effective_message.reply_text("Сколько USDT вы хотите купить?")
     await update.effective_message.delete()
+    await update.effective_message.reply_text("Сколько USDT вы хотите купить?")
     
     return ORDER
 
@@ -433,6 +433,7 @@ async def receive_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             session.commit()
             logging.info(f"User {user.id} balance updated with {amount}")
             await update.message.reply_text(f"Баланс пополнен: {user.formatted_balance} USDT.")
+            await display_account(update, user, session)
         else:
             await update.message.reply_text("Аккаунт не найден.")
             # Must be impossible. Redirect to registration.
@@ -447,7 +448,7 @@ async def change_card_details(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     return CHANGE_CARD_DETAILS
 
-async def change_card_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def receive_card_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
     card_number = ''.join(update.message.text.strip().split())
     if card_number.isdigit():
         card = CreditCard(card_number)
@@ -457,13 +458,13 @@ async def change_card_details(update: Update, context: ContextTypes.DEFAULT_TYPE
                     user.card = card.number
                     session.commit()
                     logging.info(f"User card details changed to {card.number}")
-                    await update.message.reply_text(f"Реквизиты успешно изменены {card.number}.")
+                    await update.message.reply_text(f"Реквизиты изменены: {card.number}.")
                     await display_account(update, user, session)
                     return ConversationHandler.END
                 elif user := context.user_data.get('new_user', None):
                     user.card = card.number
                     logging.info(f"User card details changed to {card.number}")
-                    await update.message.reply_text(f"Реквизиты успешно изменены {card.number}.")
+                    await update.message.reply_text(f"Реквизиты изменены: {card.number}.")
                     await update.effective_message.reply_text("Предоставьте новый курс:")
                     return CHANGE_EXCHANGE_RATE
                 else:
@@ -532,6 +533,7 @@ async def receive_currency(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         logging.info(f"User {user.id} currency changed to {currency}")
         await update.callback_query.answer(f"Валюта обновлена: {currency}")
+        await update.effective_message.delete()
 
         await display_account(update, user, session)
         return ConversationHandler.END
@@ -623,7 +625,7 @@ async def main():
     conv_handler_card_details = ConversationHandler(
         entry_points=[CallbackQueryHandler(change_card_details, pattern=HandlerNames.CHANGE_CARD_DETAILS)],
         states={
-            CHANGE_CARD_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, change_card_details)],
+            CHANGE_CARD_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_card_details)],
         },
         fallbacks=[cancel_handler],
         persistent=False,
